@@ -1,0 +1,83 @@
+seed_capital: 1000000  # 시드 100만원 (KRW)
+
+risk:
+  stop_loss_pct: 0.09        # 손절 9% (10%에서 축소 - 백테스트로 검증한 손익비 개선. 8%는 MDD가 악화되어 기각)
+  take_profit_pct: 0.07      # 익절 7% (즉시 청산 - 트레일링 방식은 백테스트 결과 더 나빠서 기각, risk_manager.py 참고)
+  position_size_pct: 0.30    # 종목당 비중 30%
+  daily_max_loss_pct: 0.30   # 일일 최대 손실한도 30% (시드 대비, 도달 시 당일 신규 진입 중단)
+
+strategies:
+  trend_following:
+    ma_cross:
+      enabled: true
+      short_window: 5
+      long_window: 20
+    bollinger_breakout:
+      enabled: false   # 백테스트 결과 돈치안 채널로 교체하는 게 더 나아서 비활성 (아래 참고)
+      window: 20
+      num_std: 2.0
+    donchian_breakout:
+      enabled: true    # 볼린저 대체 - 20일 신고가 돌파 매수 / 10일 신저가 이탈 매도 (터틀 트레이딩 스타일)
+      entry_window: 20
+      exit_window: 10
+    macd:
+      enabled: false   # 백테스트 검증 중 (아래 "다음 방향 검증 기록" 참고)
+      fast: 12
+      slow: 26
+      signal: 9
+  mean_reversion:
+    rsi:
+      enabled: true
+      period: 14
+      oversold: 30
+      overbought: 70
+    volatility_breakout:
+      enabled: true
+      k: 0.5   # Larry Williams 변동성 돌파 계수
+
+regime_filter:
+  enabled: true
+  adx_period: 14
+  trend_threshold: 25.0   # ADX >= this: 추세추종 전략만 신규 진입 허용
+  range_threshold: 20.0   # ADX <= this: 평균회귀 전략만 신규 진입 허용
+                          # (20~25 사이는 애매 구간 -> 신규 진입 보류, 청산은 항상 허용)
+
+signal_combination:
+  entry_mode: any   # "any": 활성 구간(추세/횡보)에 속한 전략 중 하나만 신호를 내도 진입
+                    # "all": 전부 동의해야 진입 (더 엄격하지만, 서로 다른 로직의 전략끼리는
+                    #        같은 날 동시에 신호가 겹치는 경우가 드물어 거래가 거의 발생하지 않을 수 있음)
+  rank_entries_by_momentum: false   # true면 같은 날 여러 종목이 동시에 신호를 낼 때
+                                    # 최근 momentum_window일 수익률이 가장 큰 종목부터 자본 배정
+  momentum_window: 20
+
+volume_filter:
+  enabled: true      # 백테스트로 검증한 순수 개선 (아래 "다음 방향 검증 기록" 참고)
+  window: 20
+  multiplier: 1.5    # 최근 20일 평균 거래량의 1.5배 이상일 때만 진입 확인
+
+costs:
+  commission_pct: 0.015   # 매수/매도 각각 부과되는 수수료율 (%), 증권사별 상이
+  sell_tax_pct: 0.18      # 매도 시 증권거래세 등 (%), 국내 상장주식 기준 예시치 (변경될 수 있음)
+
+data_feed:
+  provider: yfinance   # 임시 데이터 소스. 증권사 API 연동 후 교체 예정
+  interval: "1d"
+  lookback_days: 100   # 모의투자(paper) 모드에서 신호 계산에 쓰는 최근 봉 개수
+
+backtest:
+  history_days: 1250   # 약 5년치 거래일 (상승장/하락장/횡보장이 골고루 섞이도록)
+
+watchlist:
+  - "005930.KS"   # 삼성전자 (반도체)
+  - "058470.KQ"   # 리노공업 (반도체 부품, 100만원 시드에 맞춰 SK하이닉스 대체 - 226만원짜리라 비중 60%로도 1주도 못 샀음)
+  - "035420.KS"   # NAVER (플랫폼)
+  - "035720.KS"   # 카카오 (플랫폼, 2022년 이후 뚜렷한 하락 구간 포함)
+  - "204320.KS"   # 만도 (자동차 부품, 100만원 시드에 맞춰 현대차 대체 - 46.5만원이라 비중 30%로 0주였음)
+  - "051910.KS"   # LG화학 (2차전지/화학, 2022년 급등 후 조정)
+  - "105560.KS"   # KB금융 (금융지주)
+  - "015760.KS"   # 한국전력 (유틸리티, 장기 박스권/약세 성향)
+  - "068270.KS"   # 셀트리온 (바이오)
+  - "003550.KS"   # LG (지주사)
+
+broker:
+  provider: mock   # 증권사 API 준비되면 실브로커 어댑터로 교체
