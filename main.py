@@ -85,10 +85,10 @@ def build_strategies(config: dict) -> list:
     return strategies
 
 
-def build_risk_manager(config: dict) -> RiskManager:
+def build_risk_manager(config: dict, seed_capital: float | None = None) -> RiskManager:
     risk_cfg = config["risk"]
     return RiskManager(
-        seed_capital=config["seed_capital"],
+        seed_capital=seed_capital if seed_capital is not None else config["seed_capital"],
         stop_loss_pct=risk_cfg["stop_loss_pct"],
         take_profit_pct=risk_cfg["take_profit_pct"],
         position_size_pct=risk_cfg["position_size_pct"],
@@ -107,10 +107,10 @@ def build_regime_filter(config: dict) -> RegimeFilter | None:
     )
 
 
-def build_broker(config: dict) -> MockBroker:
+def build_broker(config: dict, seed_capital: float | None = None) -> MockBroker:
     costs_cfg = config.get("costs", {})
     return MockBroker(
-        seed_capital=config["seed_capital"],
+        seed_capital=seed_capital if seed_capital is not None else config["seed_capital"],
         commission_pct=costs_cfg.get("commission_pct", 0.0),
         sell_tax_pct=costs_cfg.get("sell_tax_pct", 0.0),
     )
@@ -123,13 +123,15 @@ def build_volume_filter(config: dict) -> VolumeFilter | None:
     return VolumeFilter(window=vf_cfg["window"], multiplier=vf_cfg["multiplier"])
 
 
-def build_engine(config: dict, broker: MockBroker, data_feed: YFinanceDataFeed) -> TradingEngine:
+def build_engine(
+    config: dict, broker: MockBroker, data_feed: YFinanceDataFeed, seed_capital: float | None = None
+) -> TradingEngine:
     signal_cfg = config.get("signal_combination", {})
     return TradingEngine(
         broker=broker,
         data_feed=data_feed,
         strategies=build_strategies(config),
-        risk_manager=build_risk_manager(config),
+        risk_manager=build_risk_manager(config, seed_capital=seed_capital),
         watchlist=config["watchlist"],
         interval=config["data_feed"]["interval"],
         lookback=config["data_feed"]["lookback_days"],
@@ -141,10 +143,31 @@ def build_engine(config: dict, broker: MockBroker, data_feed: YFinanceDataFeed) 
     )
 
 
+def strategy_allocation_pct(config: dict) -> float:
+    """Fraction of seed_capital run through the active strategy. The rest is
+    the Buy & Hold sleeve in hybrid mode. Returns 1.0 (all-strategy) when
+    hybrid mode is off.
+    """
+    hybrid_cfg = config.get("hybrid", {})
+    if not hybrid_cfg.get("enabled", False):
+        return 1.0
+    return hybrid_cfg.get("strategy_allocation_pct", 1.0)
+
+
 def run_paper(config: dict) -> None:
-    broker = build_broker(config)
+    alloc_pct = strategy_allocation_pct(config)
+    strategy_seed = config["seed_capital"] * alloc_pct
+
+    if alloc_pct < 1.0:
+        logger.warning(
+            "hybrid mode: paper/live tracking of the buy_and_hold sleeve is not implemented yet "
+            "(needs persistent state across runs) - only the %.0f%% strategy sleeve (seed=%.0f) runs here.",
+            alloc_pct * 100, strategy_seed,
+        )
+
+    broker = build_broker(config, seed_capital=strategy_seed)
     data_feed = YFinanceDataFeed()
-    engine = build_engine(config, broker, data_feed)
+    engine = build_engine(config, broker, data_feed, seed_capital=strategy_seed)
 
     equity = engine.run_once()
     logger.info(
@@ -155,11 +178,17 @@ def run_paper(config: dict) -> None:
 
 def run_backtest(config: dict) -> None:
     from backtest.backtest_runner import BacktestRunner
+    from backtest.benchmark import run_buy_and_hold
     from backtest.metrics import max_drawdown_pct, trade_stats
 
-    broker = build_broker(config)
+    total_seed = config["seed_capital"]
+    alloc_pct = strategy_allocation_pct(config)
+    strategy_seed = total_seed * alloc_pct
+    bh_seed = total_seed - strategy_seed
+
+    broker = build_broker(config, seed_capital=strategy_seed)
     data_feed = YFinanceDataFeed()
-    engine = build_engine(config, broker, data_feed)
+    engine = build_engine(config, broker, data_feed, seed_capital=strategy_seed)
 
     history_days = config.get("backtest", {}).get("history_days", 500)
     symbol_data = {}
@@ -175,21 +204,60 @@ def run_backtest(config: dict) -> None:
     min_bars = max(strategy_min_bars, regime_min_bars)
 
     runner = BacktestRunner(engine, min_bars=min_bars)
-    equity_curve = runner.run(symbol_data)
+    strategy_curve = runner.run(symbol_data)
 
-    start_equity = config["seed_capital"]
-    end_equity = float(equity_curve["equity"].iloc[-1])
-    total_return_pct = (end_equity / start_equity - 1) * 100
-    mdd_pct = max_drawdown_pct(equity_curve["equity"])
+    strategy_end_equity = float(strategy_curve["equity"].iloc[-1])
+    strategy_return_pct = (strategy_end_equity / strategy_seed - 1) * 100 if strategy_seed > 0 else 0.0
+    strategy_mdd_pct = max_drawdown_pct(strategy_curve["equity"])
     stats = trade_stats(broker.order_log)
 
     logger.info(
-        "backtest complete. start=%.0f end=%.0f return=%.2f%% max_drawdown=%.2f%% "
+        "strategy sleeve (%.0f%% of seed=%.0f). end=%.0f return=%.2f%% max_drawdown=%.2f%% "
         "round_trips=%d win_rate=%.1f%% orders=%d",
-        start_equity, end_equity, total_return_pct, mdd_pct,
+        alloc_pct * 100, strategy_seed, strategy_end_equity, strategy_return_pct, strategy_mdd_pct,
         stats["num_round_trips"], stats["win_rate_pct"], len(broker.order_log),
     )
-    print(equity_curve.tail(10))
+
+    costs_cfg = config.get("costs", {})
+    bh_curve = run_buy_and_hold(
+        symbol_data,
+        seed_capital=bh_seed if bh_seed > 0 else total_seed,
+        start_bar_index=min_bars,
+        commission_pct=costs_cfg.get("commission_pct", 0.0),
+    )
+    bh_end_equity = float(bh_curve["equity"].iloc[-1])
+    bh_seed_for_return = bh_seed if bh_seed > 0 else total_seed
+    bh_return_pct = (bh_end_equity / bh_seed_for_return - 1) * 100
+    bh_mdd_pct = max_drawdown_pct(bh_curve["equity"])
+
+    if bh_seed <= 0:
+        # pure strategy mode (hybrid off): buy_and_hold is a benchmark only,
+        # not capital actually allocated - report the comparison and stop.
+        logger.info(
+            "buy_and_hold benchmark. seed=%.0f end=%.0f return=%.2f%% max_drawdown=%.2f%% "
+            "(strategy vs benchmark return: %+.2f%%p)",
+            bh_seed_for_return, bh_end_equity, bh_return_pct, bh_mdd_pct,
+            strategy_return_pct - bh_return_pct,
+        )
+        print(strategy_curve.tail(10))
+        return
+
+    combined_equity = (strategy_curve["equity"] + bh_curve["equity"]).dropna()
+    combined_end_equity = float(combined_equity.iloc[-1])
+    combined_return_pct = (combined_end_equity / total_seed - 1) * 100
+    combined_mdd_pct = max_drawdown_pct(combined_equity)
+
+    logger.info(
+        "buy_and_hold sleeve (%.0f%% of seed=%.0f). end=%.0f return=%.2f%% max_drawdown=%.2f%%",
+        (1 - alloc_pct) * 100, bh_seed, bh_end_equity, bh_return_pct, bh_mdd_pct,
+    )
+    logger.info(
+        "hybrid combined (strategy %.0f%% / buy_and_hold %.0f%%). seed=%.0f end=%.0f "
+        "return=%.2f%% max_drawdown=%.2f%%",
+        alloc_pct * 100, (1 - alloc_pct) * 100, total_seed, combined_end_equity,
+        combined_return_pct, combined_mdd_pct,
+    )
+    print(combined_equity.tail(10))
 
 
 def main() -> None:

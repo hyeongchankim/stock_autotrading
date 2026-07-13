@@ -60,12 +60,23 @@ costs:
   sell_tax_pct: 0.18      # 매도 시 증권거래세 등 (%), 국내 상장주식 기준 예시치 (변경될 수 있음)
 
 data_feed:
-  provider: yfinance   # 임시 데이터 소스. 증권사 API 연동 후 교체 예정
+  # 현재 데이터 소스는 main.py에서 YFinanceDataFeed()로 하드코딩되어 있음 (임시).
+  # 증권사 API 연동 시 여기 provider 값을 바꾸는 게 아니라 main.py의 build_engine에서
+  # 실제 클래스로 교체해야 함 - README "실제 증권사 API 연동하는 법" 참고.
   interval: "1d"
   lookback_days: 100   # 모의투자(paper) 모드에서 신호 계산에 쓰는 최근 봉 개수
 
 backtest:
-  history_days: 1250   # 약 5년치 거래일 (상승장/하락장/횡보장이 골고루 섞이도록)
+  history_days: 1700   # 약 6.75년치 거래일 (2020 코로나 급락 + 2022 금리인상 하락장 모두 포함)
+
+hybrid:
+  enabled: true                  # 시드를 전략 슬리브 + Buy&Hold 슬리브로 나눠서 운용 (백테스트로 검증한 기본값)
+  strategy_allocation_pct: 0.5   # 시드 중 전략에 배분하는 비율 (나머지는 워치리스트 동일비중 매수 후 보유)
+                                  # 0.5가 MDD 최저점이라 채택 (README "하이브리드 구조 검증 기록" 참고).
+                                  # 0.2~0.8 사이 다른 값도 전부 지원되니 성향에 맞게 조정 가능:
+                                  #   낮출수록(0.2~0.3) 수익률↑ MDD도 다시 소폭↑, 1.0=순수 전략, 0.0=순수 Buy&Hold
+                                  # paper/live 모드는 아직 Buy&Hold 슬리브 상태를 세션 간 유지하지 못함
+                                  # (영속 저장소 미구현) - 백테스트에서만 결합 성과를 계산함
 
 watchlist:
   - "005930.KS"   # 삼성전자 (반도체)
@@ -79,5 +90,6 @@ watchlist:
   - "068270.KS"   # 셀트리온 (바이오)
   - "003550.KS"   # LG (지주사)
 
-broker:
-  provider: mock   # 증권사 API 준비되면 실브로커 어댑터로 교체
+# 브로커도 데이터 소스와 마찬가지로 main.py에 MockBroker()가 하드코딩되어 있음 (임시).
+# 여기에 broker.provider 같은 설정값을 추가해도 실제로는 아무 효과가 없으니 만들지 말 것 -
+# 이전에 이런 형태의 "죽은 파라미터"가 있었다가 제거됨. 실브로커 연동은 main.py를 직접 수정.
