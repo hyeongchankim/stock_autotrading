@@ -13,8 +13,11 @@ from pathlib import Path
 
 import yaml
 
+from broker.base import BrokerBase
+from broker.kis_broker import KisBroker
 from broker.mock_broker import MockBroker
 from data.base import DataFeedBase
+from data.kis_data_feed import KisDataFeed
 from data.krx_investor_feed import KrxInvestorFlowFeed, WhaleEnrichedDataFeed
 from data.yfinance_feed import YFinanceDataFeed
 from engine.trading_engine import TradingEngine
@@ -118,7 +121,17 @@ def build_regime_filter(config: dict) -> RegimeFilter | None:
     )
 
 
-def build_broker(config: dict, seed_capital: float | None = None) -> MockBroker:
+def build_broker(config: dict, seed_capital: float | None = None) -> BrokerBase:
+    """Returns MockBroker unless broker.provider is "kis", in which case it
+    connects to the real KIS account (see broker.kis.env - defaults to
+    demo/paper trading, never assume "real"). seed_capital is only
+    meaningful for MockBroker; a real broker reports its own actual balance.
+    """
+    broker_cfg = config.get("broker", {})
+    if broker_cfg.get("provider") == "kis":
+        kis_cfg = broker_cfg.get("kis", {})
+        return KisBroker(env=kis_cfg.get("env", "demo"), watchlist=config["watchlist"])
+
     costs_cfg = config.get("costs", {})
     return MockBroker(
         seed_capital=seed_capital if seed_capital is not None else config["seed_capital"],
@@ -135,12 +148,20 @@ def build_volume_filter(config: dict) -> VolumeFilter | None:
 
 
 def build_data_feed(config: dict) -> DataFeedBase:
-    """Plain price data by default. When whale_flow is enabled, wraps it so
-    every fetch also carries institutional_net/foreign_net columns (KRX
+    """yfinance by default, or the real KIS quote API when broker.provider
+    is "kis" (same env - demo/real - as the broker). When whale_flow is
+    enabled, wraps whichever base feed in WhaleEnrichedDataFeed so every
+    fetch also carries institutional_net/foreign_net columns (KRX
     Information Data System - requires KRX_ID/KRX_PW env vars, degrades
     gracefully to plain OHLCV if that login isn't available).
     """
-    base_feed = YFinanceDataFeed()
+    broker_cfg = config.get("broker", {})
+    if broker_cfg.get("provider") == "kis":
+        kis_cfg = broker_cfg.get("kis", {})
+        base_feed: DataFeedBase = KisDataFeed(env=kis_cfg.get("env", "demo"))
+    else:
+        base_feed = YFinanceDataFeed()
+
     whale_cfg = config["strategies"]["trend_following"].get("whale_flow", {})
     if not whale_cfg.get("enabled", False):
         return base_feed
@@ -148,7 +169,7 @@ def build_data_feed(config: dict) -> DataFeedBase:
 
 
 def build_engine(
-    config: dict, broker: MockBroker, data_feed: DataFeedBase, seed_capital: float | None = None
+    config: dict, broker: BrokerBase, data_feed: DataFeedBase, seed_capital: float | None = None
 ) -> TradingEngine:
     signal_cfg = config.get("signal_combination", {})
     return TradingEngine(
@@ -210,8 +231,21 @@ def run_backtest(config: dict) -> None:
     strategy_seed = total_seed * alloc_pct
     bh_seed = total_seed - strategy_seed
 
-    broker = build_broker(config, seed_capital=strategy_seed)
-    data_feed = build_data_feed(config)
+    # Backtesting always uses MockBroker + yfinance regardless of
+    # broker.provider - a real broker's API isn't meant for bulk historical
+    # queries (rate limits, and it reports live account state, not a
+    # simulated seed). whale_flow enrichment still applies if enabled.
+    costs_cfg = config.get("costs", {})
+    broker = MockBroker(
+        seed_capital=strategy_seed,
+        commission_pct=costs_cfg.get("commission_pct", 0.0),
+        sell_tax_pct=costs_cfg.get("sell_tax_pct", 0.0),
+    )
+    base_feed = YFinanceDataFeed()
+    whale_cfg = config["strategies"]["trend_following"].get("whale_flow", {})
+    data_feed: DataFeedBase = (
+        WhaleEnrichedDataFeed(base_feed, KrxInvestorFlowFeed()) if whale_cfg.get("enabled", False) else base_feed
+    )
     engine = build_engine(config, broker, data_feed, seed_capital=strategy_seed)
 
     history_days = config.get("backtest", {}).get("history_days", 500)
@@ -242,7 +276,6 @@ def run_backtest(config: dict) -> None:
         stats["num_round_trips"], stats["win_rate_pct"], len(broker.order_log),
     )
 
-    costs_cfg = config.get("costs", {})
     bh_curve = run_buy_and_hold(
         symbol_data,
         seed_capital=bh_seed if bh_seed > 0 else total_seed,

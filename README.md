@@ -164,15 +164,64 @@ python -m unittest discover tests
 전략 간 확인(confirmation) 로직이나 가중치 투표 방식으로 바꾸고 싶다면
 `engine/trading_engine.py`의 `_evaluate_strategies`만 수정하면 됩니다.
 
-## 실제 증권사 API 연동하는 법
+## 실제 증권사 API 연동: 한국투자증권(KIS) Open API
 
-1. `broker/base.py`의 `BrokerBase`를 상속하는 새 클래스를 만듭니다. (예: `broker/kis_broker.py`)
-2. `get_cash_balance`, `get_positions`, `get_current_price`, `place_order` 4개 메서드를 실제 API 호출로 구현합니다.
-3. `data/base.py`의 `DataFeedBase`도 마찬가지로 실제 시세 API로 구현하는 새 클래스를 만듭니다. (예: `data/kis_data_feed.py`)
-4. `main.py`의 `MockBroker(...)` / `YFinanceDataFeed()` 부분만 새로 만든 클래스로 교체합니다.
-5. `config.yaml`의 `broker.provider`, `data_feed.provider` 값을 갱신하고, API 키는 코드에 하드코딩하지 말고 환경변수나 `.env`로 관리하세요.
+`broker/kis_broker.py`(`KisBroker`)와 `data/kis_data_feed.py`(`KisDataFeed`)로 실제 KIS 계좌
+연동을 구현했다. 참조 스펙은 KIS 공식 샘플 저장소
+([koreainvestment/open-trading-api](https://github.com/koreainvestment/open-trading-api))에서
+확인했다 - 특히 tr_id는 그 저장소 안에서도 파일마다 다르게 적혀 있는 걸 발견해서
+(`examples_user/domestic_stock/domestic_stock_functions.py`는 `TTTC0011U/0012U`,
+`backtester/kis_backtest/providers/kis/constants.py`는 `TTTC0801U/0802U`) 더 신뢰할 수 있는
+후자(백테스터 모듈 + 도큐먼트 문구와 일치)를 채택했다. **실전 투입 전 최신 KIS 공식 문서로
+한 번 더 대조 확인 권장.**
 
-`strategies/`, `risk/`, `engine/`, `backtest/`는 브로커가 무엇이든 그대로 재사용됩니다.
+### 설정
+
+1. KIS 홈페이지에서 OpenAPI 서비스 신청 → **실전투자용**과 **모의투자용** 앱키/시크릿을
+   각각 발급 (KIS는 이 둘을 별도로 발급한다)
+2. **계좌번호도 실전/모의가 서로 다르다** - 모의투자를 신청하면 KIS가 별도의 가상
+   계좌번호를 발급해준다. 실전계좌번호를 모의투자에 쓰면 안 된다.
+3. 아래 환경변수를 본인 PC에 설정 (Claude에게 값 자체를 알려줄 필요 없음):
+   ```powershell
+   [System.Environment]::SetEnvironmentVariable("KIS_APP_KEY", "실전 앱키", "User")
+   [System.Environment]::SetEnvironmentVariable("KIS_APP_SECRET", "실전 앱시크릿", "User")
+   [System.Environment]::SetEnvironmentVariable("KIS_ACCOUNT_NO", "실전 계좌번호 앞 8자리", "User")
+   [System.Environment]::SetEnvironmentVariable("KIS_ACCOUNT_PRODUCT_CD", "01", "User")
+   [System.Environment]::SetEnvironmentVariable("KIS_PAPER_APP_KEY", "모의 앱키", "User")
+   [System.Environment]::SetEnvironmentVariable("KIS_PAPER_APP_SECRET", "모의 앱시크릿", "User")
+   [System.Environment]::SetEnvironmentVariable("KIS_PAPER_ACCOUNT_NO", "모의 계좌번호 앞 8자리", "User")
+   [System.Environment]::SetEnvironmentVariable("KIS_PAPER_ACCOUNT_PRODUCT_CD", "01", "User")
+   ```
+4. 새 터미널에서 `config.yaml`의 `broker.provider: kis`로 변경 (기본값은 `mock`)
+5. `broker.kis.env`는 반드시 `demo`(모의투자)로 시작 - `real`은 충분히 검증 후 본인이 직접 전환
+
+### 안전장치
+
+- **`broker.kis.env`의 기본값은 `demo`.** `real`로 바꾸는 건 사용자 본인의 명시적 결정이어야 함.
+- **백테스트는 `broker.provider` 값과 무관하게 항상 `MockBroker`+`yfinance`로 돈다** (`run_backtest`에
+  하드코딩됨) - 실계좌 API에 수년치 데이터를 반복 조회하는 건 rate limit도 걸리고 부적절함.
+  KIS 연동은 `run_paper`(모의/실전 주문 실행)에만 적용됨.
+- 토큰은 `.kis_cache/`에 캐시되어 재발급을 최소화함 (KIS는 토큰 재발급마다 알림톡을 보냄) -
+  이 디렉터리는 `.gitignore`에 등록됨.
+- `env="real"`로 주문을 낼 때마다 `PLACING REAL-MONEY ORDER` 경고 로그가 남음.
+- 실전/모의 계좌번호를 완전히 분리된 환경변수(`KIS_ACCOUNT_NO` vs `KIS_PAPER_ACCOUNT_NO`)로
+  관리해서 서로 섞여 들어갈 수 없게 만듦 - 초기 구현에서 이 둘을 하나로 합쳐뒀다가
+  발견하고 수정함 (`tests/test_kis_broker.py`에 회귀 테스트 추가).
+- 계좌번호나 앱키/시크릿이 없으면 `KisCredentialsError`로 즉시 실패 (조용히 잘못된
+  계좌로 주문 나가는 일 방지).
+
+### 아직 안 된 것 (실전 투입 전 필수)
+
+- **KIS 모의투자 계좌로 실제 검증 안 함** - 지금까지는 유닛 테스트(mock 응답)로만 확인했다.
+  실제 모의투자 API 호출로 주문/잔고/시세가 정상 동작하는지 먼저 확인해야 한다.
+- 호가단위(tick size), 상한가/하한가, 부분체결, 슬리피지 미반영 (`ORD_DVSN="00"` 지정가로
+  계산된 가격을 그대로 주문가로 사용함)
+- 상태 영속성 없음 - `python main.py --mode paper`를 매번 새로 실행하면 `RiskManager`의
+  일일 손실 추적 등이 초기화됨. 장중 상시 실행하려면 스케줄러 + 상태 저장 로직이 별도로 필요.
+- 하이브리드(Buy&Hold 슬리브) 상태도 paper/live 모드에서는 세션 간 유지 안 됨 (위 "하이브리드
+  구조 검증 기록" 참고)
+
+`strategies/`, `risk/`, `engine/`, `backtest/`는 브로커가 무엇이든 그대로 재사용된다.
 
 ## 트러블슈팅: SSL 인증서 오류 (Windows + 한글 계정명)
 

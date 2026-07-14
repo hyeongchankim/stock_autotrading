@@ -69,9 +69,6 @@ costs:
   sell_tax_pct: 0.18      # 매도 시 증권거래세 등 (%), 국내 상장주식 기준 예시치 (변경될 수 있음)
 
 data_feed:
-  # 현재 데이터 소스는 main.py에서 YFinanceDataFeed()로 하드코딩되어 있음 (임시).
-  # 증권사 API 연동 시 여기 provider 값을 바꾸는 게 아니라 main.py의 build_engine에서
-  # 실제 클래스로 교체해야 함 - README "실제 증권사 API 연동하는 법" 참고.
   interval: "1d"
   lookback_days: 100   # 모의투자(paper) 모드에서 신호 계산에 쓰는 최근 봉 개수
 
@@ -99,6 +96,13 @@ watchlist:
   - "068270.KS"   # 셀트리온 (바이오)
   - "003550.KS"   # LG (지주사)
 
-# 브로커도 데이터 소스와 마찬가지로 main.py에 MockBroker()가 하드코딩되어 있음 (임시).
-# 여기에 broker.provider 같은 설정값을 추가해도 실제로는 아무 효과가 없으니 만들지 말 것 -
-# 이전에 이런 형태의 "죽은 파라미터"가 있었다가 제거됨. 실브로커 연동은 main.py를 직접 수정.
+broker:
+  provider: kis    # mock | kis
+                    # "kis"는 실제 한국투자증권 계좌로 paper 모드에서만 적용됨.
+                    # backtest 모드는 provider 값과 무관하게 항상 mock+yfinance로 돈다
+                    # (실계좌 API에 반복 조회하기엔 느리고 rate limit이 걸림).
+  kis:
+    env: demo       # demo(모의투자) | real(실전투자)
+                    # 절대 real을 기본값으로 두지 말 것 - 모의투자로 충분히 검증 후에만 전환.
+                    # KIS_APP_KEY/KIS_APP_SECRET(실전), KIS_PAPER_APP_KEY/KIS_PAPER_APP_SECRET(모의),
+                    # KIS_ACCOUNT_NO, KIS_ACCOUNT_PRODUCT_CD 환경변수가 필요함 (README 참고)
