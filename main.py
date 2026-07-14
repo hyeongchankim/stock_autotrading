@@ -14,6 +14,8 @@ from pathlib import Path
 import yaml
 
 from broker.mock_broker import MockBroker
+from data.base import DataFeedBase
+from data.krx_investor_feed import KrxInvestorFlowFeed, WhaleEnrichedDataFeed
 from data.yfinance_feed import YFinanceDataFeed
 from engine.trading_engine import TradingEngine
 from risk.risk_manager import RiskManager
@@ -26,6 +28,7 @@ from strategies.trend_following import (
     MovingAverageCrossStrategy,
 )
 from strategies.volume_filter import VolumeFilter
+from strategies.whale_flow import WhaleFlowStrategy
 from utils.logger import setup_logging
 
 setup_logging()
@@ -69,6 +72,14 @@ def build_strategies(config: dict) -> list:
                 fast=tf["macd"]["fast"],
                 slow=tf["macd"]["slow"],
                 signal=tf["macd"]["signal"],
+            )
+        )
+    if tf.get("whale_flow", {}).get("enabled"):
+        strategies.append(
+            WhaleFlowStrategy(
+                window=tf["whale_flow"]["window"],
+                buy_threshold_ratio=tf["whale_flow"]["buy_threshold_ratio"],
+                sell_threshold_ratio=tf["whale_flow"]["sell_threshold_ratio"],
             )
         )
     if mr["rsi"]["enabled"]:
@@ -123,8 +134,21 @@ def build_volume_filter(config: dict) -> VolumeFilter | None:
     return VolumeFilter(window=vf_cfg["window"], multiplier=vf_cfg["multiplier"])
 
 
+def build_data_feed(config: dict) -> DataFeedBase:
+    """Plain price data by default. When whale_flow is enabled, wraps it so
+    every fetch also carries institutional_net/foreign_net columns (KRX
+    Information Data System - requires KRX_ID/KRX_PW env vars, degrades
+    gracefully to plain OHLCV if that login isn't available).
+    """
+    base_feed = YFinanceDataFeed()
+    whale_cfg = config["strategies"]["trend_following"].get("whale_flow", {})
+    if not whale_cfg.get("enabled", False):
+        return base_feed
+    return WhaleEnrichedDataFeed(base_feed, KrxInvestorFlowFeed())
+
+
 def build_engine(
-    config: dict, broker: MockBroker, data_feed: YFinanceDataFeed, seed_capital: float | None = None
+    config: dict, broker: MockBroker, data_feed: DataFeedBase, seed_capital: float | None = None
 ) -> TradingEngine:
     signal_cfg = config.get("signal_combination", {})
     return TradingEngine(
@@ -166,7 +190,7 @@ def run_paper(config: dict) -> None:
         )
 
     broker = build_broker(config, seed_capital=strategy_seed)
-    data_feed = YFinanceDataFeed()
+    data_feed = build_data_feed(config)
     engine = build_engine(config, broker, data_feed, seed_capital=strategy_seed)
 
     equity = engine.run_once()
@@ -187,7 +211,7 @@ def run_backtest(config: dict) -> None:
     bh_seed = total_seed - strategy_seed
 
     broker = build_broker(config, seed_capital=strategy_seed)
-    data_feed = YFinanceDataFeed()
+    data_feed = build_data_feed(config)
     engine = build_engine(config, broker, data_feed, seed_capital=strategy_seed)
 
     history_days = config.get("backtest", {}).get("history_days", 500)

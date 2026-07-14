@@ -9,15 +9,15 @@ risk:
 strategies:
   trend_following:
     ma_cross:
-      enabled: true
+      enabled: false   # 백테스트 결과 whale_flow 단독이 더 나아서 비활성 (아래 "고래 추적 지표 검증 기록" 참고)
       short_window: 5
       long_window: 20
     bollinger_breakout:
-      enabled: false   # 백테스트 결과 돈치안 채널로 교체하는 게 더 나아서 비활성 (아래 참고)
+      enabled: false   # 돈치안 채널로 교체 후 다시 whale_flow로 교체됨 (아래 참고)
       window: 20
       num_std: 2.0
     donchian_breakout:
-      enabled: true    # 볼린저 대체 - 20일 신고가 돌파 매수 / 10일 신저가 이탈 매도 (터틀 트레이딩 스타일)
+      enabled: false   # whale_flow 단독 조합이 더 나아서 비활성 (아래 "고래 추적 지표 검증 기록" 참고)
       entry_window: 20
       exit_window: 10
     macd:
@@ -25,6 +25,15 @@ strategies:
       fast: 12
       slow: 26
       signal: 9
+    whale_flow:
+      enabled: true    # "고래 추적" - 외국인+기관 순매수 추종. 백테스트로 검증한 채택값 -
+                        # 이평선/돈치안 대신 이 전략 단독이 수익률·MDD·승률 전부 더 나았음
+                        # (아래 "고래 추적 지표 검증 기록" 참고). data.krx.co.kr 계정 필요
+                        # (KRX_ID/KRX_PW 환경변수) - 계정 없으면 자동으로 조용히 비활성 상태로
+                        # 동작함 (에러 없음, HOLD만 반환)
+      window: 5                   # 최근 5거래일 누적 순매수로 판단
+      buy_threshold_ratio: 0.05    # 5거래일 거래대금 대비 외국인+기관 순매수 비율이 +5% 이상이면 매수
+      sell_threshold_ratio: 0.05   # 같은 비율이 -5% 이하이면 매도
   mean_reversion:
     rsi:
       enabled: true

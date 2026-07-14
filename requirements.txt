@@ -2,3 +2,4 @@ pandas>=2.0
 numpy>=1.24
 PyYAML>=6.0
 yfinance>=0.2.40
+pykrx>=1.2.8   # whale_flow 전략용 (외국인/기관 순매수). data.krx.co.kr 계정 필요, 없어도 나머지는 정상 동작
