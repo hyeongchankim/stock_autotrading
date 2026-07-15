@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from broker.kis_auth import KisCredentialsError, KisSession
-from broker.kis_broker import KisBroker, _to_kis_ticker
+from broker.kis_broker import KisBroker, OrderFill, _to_kis_ticker
 from strategies.base import Signal
 
 
@@ -312,6 +312,67 @@ class TestKisBrokerCosts(unittest.TestCase):
         self.broker.place_order("005930.KS", Signal.BUY, 1, 100.0)
         sent_body = mock_post.call_args.kwargs["json"]
         self.assertEqual(sent_body["ORD_UNPR"], "100")
+
+
+class TestKisBrokerDailyFills(unittest.TestCase):
+    def setUp(self):
+        self.env_patcher = _env_patch()
+        self.env_patcher.start()
+        self.token_patcher = patch("broker.kis_auth.KisSession.get_access_token", return_value="fake-token")
+        self.token_patcher.start()
+        self.broker = KisBroker(env="demo", watchlist=["005930.KS"])
+
+    def tearDown(self):
+        self.token_patcher.stop()
+        self.env_patcher.stop()
+
+    @patch("broker.kis_auth.requests.get")
+    def test_parses_partial_fill(self, mock_get):
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "rt_cd": "0",
+                "output1": [
+                    {
+                        "odno": "0000123456",
+                        "pdno": "005930",
+                        "ord_qty": "10",
+                        "tot_ccld_qty": "3",
+                        "rmn_qty": "7",
+                        "avg_prvs": "71000",
+                    }
+                ],
+            },
+        )
+        fills = self.broker.get_daily_fills()
+        self.assertEqual(len(fills), 1)
+        fill = fills[0]
+        self.assertEqual(fill, OrderFill(
+            order_no="0000123456", symbol="005930.KS",
+            ordered_qty=10, filled_qty=3, pending_qty=7, avg_fill_price=71000.0,
+        ))
+
+    @patch("broker.kis_auth.requests.get")
+    def test_uses_demo_tr_id(self, mock_get):
+        mock_get.return_value = MagicMock(status_code=200, json=lambda: {"rt_cd": "0", "output1": []})
+        self.broker.get_daily_fills()
+        sent_headers = mock_get.call_args.kwargs["headers"]
+        self.assertEqual(sent_headers["tr_id"], "VTTC0081R")
+
+    @patch("broker.kis_auth.requests.get")
+    def test_filters_by_order_no(self, mock_get):
+        mock_get.return_value = MagicMock(status_code=200, json=lambda: {"rt_cd": "0", "output1": []})
+        self.broker.get_daily_fills(order_no="0000123456")
+        sent_params = mock_get.call_args.kwargs["params"]
+        self.assertEqual(sent_params["ODNO"], "0000123456")
+
+    @patch("broker.kis_auth.requests.get")
+    def test_raises_on_api_failure(self, mock_get):
+        mock_get.return_value = MagicMock(
+            status_code=200, json=lambda: {"rt_cd": "1", "msg1": "account not found"}
+        )
+        with self.assertRaises(RuntimeError):
+            self.broker.get_daily_fills()
 
 
 if __name__ == "__main__":

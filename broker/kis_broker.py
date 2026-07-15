@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
+from datetime import date
 
 import requests
 
@@ -31,9 +33,25 @@ _BUY_TR_ID_REAL = "TTTC0802U"
 _SELL_TR_ID_REAL = "TTTC0801U"
 _BALANCE_TR_ID_REAL = "TTTC8434R"
 _PRICE_TR_ID = "FHKST01010100"  # same code for both real and paper
+_DAILY_FILLS_TR_ID_REAL = "TTTC0081R"  # only covers the last 3 months - fine for this bot's needs
 
 _MAX_RETRIES = 3
 _RETRY_BACKOFF_SECONDS = 1.0
+
+
+@dataclass
+class OrderFill:
+    """One row from KIS's 주식일별주문체결조회 (get_daily_fills) - the actual
+    execution status of a previously placed order. place_order()'s
+    filled=True only means KIS accepted the order, not that it fully
+    executed: a 지정가(limit) order can sit partially or wholly unfilled.
+    """
+    order_no: str
+    symbol: str
+    ordered_qty: int
+    filled_qty: int
+    pending_qty: int
+    avg_fill_price: float
 
 
 def _to_kis_ticker(symbol: str) -> str:
@@ -119,6 +137,9 @@ class KisBroker(BrokerBase):
     def _order_endpoint(self) -> str:
         return f"{self.session.base_url}/uapi/domestic-stock/v1/trading/order-cash"
 
+    def _daily_fills_endpoint(self) -> str:
+        return f"{self.session.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+
     def _balance_endpoint(self) -> str:
         return f"{self.session.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
 
@@ -176,6 +197,70 @@ class KisBroker(BrokerBase):
         if body.get("rt_cd") != "0":
             raise RuntimeError(f"KIS price inquiry failed for {symbol}: {body.get('msg1')}")
         return float(body["output"]["stck_prpr"])
+
+    def get_daily_fills(self, order_no: str = "", as_of: date | None = None) -> list[OrderFill]:
+        """Queries actual execution status via 주식일별주문체결조회
+        (inquire-daily-ccld) - covers only the last 3 months, which is all
+        this bot needs (it never holds an order open that long). Pass
+        order_no to check one specific order; leave blank to list every
+        order for as_of's date (defaults to today).
+
+        tr_id here is TTTC0081R/VTTC0081R (examples_user/domestic_stock/
+        domestic_stock_functions.py's inquire_daily_ccld, env_dv+pd_dv="inner"),
+        confirmed empirically against a real KIS demo order - NOT
+        TTTC8001R/VTTC8001R, which is what KIS's own backtester reference
+        module declares (backtester/kis_backtest/providers/kis/constants.py)
+        and what the actively-maintained third-party python-kis library
+        (Soju06/python-kis) also uses. Both of those looked more trustworthy
+        going in (two independent sources agreeing, vs. examples_user which
+        this file's own docstring already flags as internally inconsistent
+        elsewhere) - but VTTC8001R returned rt_cd="0" with a genuinely empty
+        output1 against the real demo account (output2's aggregate totals
+        were populated, so the account/params were fine - just no
+        per-order rows), while VTTC0081R returned the actual order the demo
+        account had just filled, fields matching exactly what's parsed
+        below. Lesson: cross-referencing multiple sources up front reduces
+        risk but doesn't replace testing against the real API before
+        trusting a tr_id - see place_order()'s similar TTTC0801U/0802U
+        situation, which happened to test out fine on the first guess.
+        """
+        as_of = as_of or date.today()
+        tr_id = self.session.real_tr_id(_DAILY_FILLS_TR_ID_REAL)
+        date_str = as_of.strftime("%Y%m%d")
+        params = {
+            "CANO": self.session.account_no,
+            "ACNT_PRDT_CD": self.session.account_product_cd,
+            "INQR_STRT_DT": date_str,
+            "INQR_END_DT": date_str,
+            "SLL_BUY_DVSN_CD": "00",
+            "PDNO": "",
+            "CCLD_DVSN": "00",
+            "INQR_DVSN": "00",
+            "INQR_DVSN_3": "00",
+            "ORD_GNO_BRNO": "",
+            "ODNO": order_no,
+            "INQR_DVSN_1": "",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        response = get_with_retry(self._daily_fills_endpoint(), self.session.headers(tr_id), params)
+        body = response.json()
+        if body.get("rt_cd") != "0":
+            raise RuntimeError(f"KIS daily fill inquiry failed: {body.get('msg1')}")
+
+        fills = []
+        for item in body.get("output1", []):
+            fills.append(
+                OrderFill(
+                    order_no=item.get("odno", ""),
+                    symbol=self._resolve_symbol(item.get("pdno", "")),
+                    ordered_qty=int(item.get("ord_qty", 0)),
+                    filled_qty=int(item.get("tot_ccld_qty", 0)),
+                    pending_qty=int(item.get("rmn_qty", 0)),
+                    avg_fill_price=float(item.get("avg_prvs") or 0),
+                )
+            )
+        return fills
 
     def _effective_price(self, side: Signal, fill_price: float) -> float:
         """fill_price adjusted for commission_pct (both sides) and
