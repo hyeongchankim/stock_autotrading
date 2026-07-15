@@ -143,8 +143,8 @@ class KisBroker(BrokerBase):
     def _balance_endpoint(self) -> str:
         return f"{self.session.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
 
-    def _price_endpoint(self) -> str:
-        return f"{self.session.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
+    def _price_endpoint(self, session: KisSession) -> str:
+        return f"{session.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
 
     def _inquire_balance(self) -> tuple[list[dict], list[dict]]:
         tr_id = self.session.real_tr_id(_BALANCE_TR_ID_REAL)
@@ -191,8 +191,12 @@ class KisBroker(BrokerBase):
         return positions
 
     def get_current_price(self, symbol: str) -> float:
+        # market_data_session(): quote endpoints are only reliably served
+        # through the real domain, even for a demo account - see that
+        # method's docstring.
+        md_session = self.session.market_data_session()
         params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": _to_kis_ticker(symbol)}
-        response = get_with_retry(self._price_endpoint(), self.session.headers(_PRICE_TR_ID), params)
+        response = get_with_retry(self._price_endpoint(md_session), md_session.headers(_PRICE_TR_ID), params)
         body = response.json()
         if body.get("rt_cd") != "0":
             raise RuntimeError(f"KIS price inquiry failed for {symbol}: {body.get('msg1')}")

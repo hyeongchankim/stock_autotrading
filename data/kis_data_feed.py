@@ -31,12 +31,17 @@ class KisDataFeed(DataFeedBase):
     def __init__(self, env: str = "demo", session: KisSession | None = None):
         self.session = session or KisSession(env=env)
 
-    def _endpoint(self) -> str:
-        return f"{self.session.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+    def _endpoint(self, session: KisSession) -> str:
+        return f"{session.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
 
     def get_ohlcv(self, symbol: str, interval: str = "1d", lookback: int = 100) -> pd.DataFrame:
         if interval != "1d":
             raise ValueError("KisDataFeed only supports daily bars (interval='1d')")
+
+        # market_data_session(): chart endpoints are only reliably served
+        # through the real domain, even for a demo account - see that
+        # method's docstring (broker/kis_auth.py).
+        md_session = self.session.market_data_session()
 
         ticker = _to_kis_ticker(symbol)
         # generous calendar-day span so `lookback` trading days are covered
@@ -54,7 +59,7 @@ class KisDataFeed(DataFeedBase):
                 "FID_PERIOD_DIV_CODE": "D",
                 "FID_ORG_ADJ_PRC": "0",
             }
-            response = get_with_retry(self._endpoint(), self.session.headers(_DAILY_PRICE_TR_ID), params)
+            response = get_with_retry(self._endpoint(md_session), md_session.headers(_DAILY_PRICE_TR_ID), params)
             body = response.json()
             if body.get("rt_cd") != "0":
                 raise RuntimeError(f"KIS daily price fetch failed for {symbol}: {body.get('msg1')}")

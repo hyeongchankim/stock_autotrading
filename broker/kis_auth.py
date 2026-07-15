@@ -109,6 +109,27 @@ class KisSession:
 
         self._access_token: str | None = None
         self._token_expiry: float = 0.0
+        self._market_data_session: KisSession | None = None
+
+    def market_data_session(self) -> "KisSession":
+        """Session to use for market-data endpoints (current price, daily
+        chart) - KIS only reliably serves these through the real domain
+        regardless of account type, confirmed empirically: 8 repeated calls
+        to the daily-chart endpoint through the demo domain had a 500 error
+        (12.5%), the same calls through the real domain had none, matching
+        the actively-maintained python-kis library's consistent choice to
+        always route every quote/chart call through the real domain even
+        for virtual accounts. Order placement/balance/fills still use this
+        session's own env unchanged - only read-only market data is
+        affected. Requires KIS_APP_KEY/KIS_APP_SECRET (real credentials) to
+        be configured even when only running paper trading - a dependency
+        this introduces that didn't exist before.
+        """
+        if self.env == "real":
+            return self
+        if self._market_data_session is None:
+            self._market_data_session = KisSession(env="real")
+        return self._market_data_session
 
     def _token_cache_path(self) -> Path:
         return _TOKEN_CACHE_DIR / f"token_{self.env}.json"

@@ -70,6 +70,30 @@ class TestKisSession(unittest.TestCase):
             with self.assertRaises(KisCredentialsError):
                 KisSession(env="demo")
 
+    def test_market_data_session_is_self_for_real_env(self):
+        with _env_patch():
+            session = KisSession(env="real")
+            self.assertIs(session.market_data_session(), session)
+
+    def test_market_data_session_is_a_real_session_for_demo_env(self):
+        with _env_patch():
+            session = KisSession(env="demo")
+            md_session = session.market_data_session()
+            self.assertEqual(md_session.env, "real")
+            self.assertEqual(md_session.base_url, session.market_data_session().base_url)
+            self.assertNotEqual(md_session.base_url, session.base_url)
+
+    def test_market_data_session_is_cached(self):
+        with _env_patch():
+            session = KisSession(env="demo")
+            self.assertIs(session.market_data_session(), session.market_data_session())
+
+    def test_market_data_session_requires_real_credentials(self):
+        with _env_patch(KIS_APP_KEY="", KIS_APP_SECRET=""):
+            session = KisSession(env="demo")  # demo credentials alone are fine to construct
+            with self.assertRaises(KisCredentialsError):
+                session.market_data_session()  # but real ones are needed for market data
+
 
 class TestKisBroker(unittest.TestCase):
     def setUp(self):
@@ -115,6 +139,18 @@ class TestKisBroker(unittest.TestCase):
             status_code=200, json=lambda: {"rt_cd": "0", "output": {"stck_prpr": "71500"}}
         )
         self.assertEqual(self.broker.get_current_price("005930.KS"), 71500.0)
+
+    @patch("broker.kis_auth.requests.get")
+    def test_get_current_price_uses_real_domain_even_for_demo_broker(self, mock_get):
+        # self.broker is env="demo" (see setUp) - quotes must still go
+        # through the real domain (market_data_session()).
+        mock_get.return_value = MagicMock(
+            status_code=200, json=lambda: {"rt_cd": "0", "output": {"stck_prpr": "71500"}}
+        )
+        self.broker.get_current_price("005930.KS")
+        sent_url = mock_get.call_args.args[0]
+        self.assertIn("openapi.koreainvestment.com", sent_url)
+        self.assertNotIn("openapivts", sent_url)
 
     @patch("broker.kis_broker.requests.post")
     @patch("broker.kis_auth.requests.get")
