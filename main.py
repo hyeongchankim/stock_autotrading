@@ -257,9 +257,13 @@ def run_paper(config: dict) -> None:
 
     if bh_sleeve is not None:
         bh_value = bh_sleeve.current_value(day_prices)
+        # "virtual" is not a typo/filler word - see BuyAndHoldSleeve's docstring:
+        # this sleeve never places a real order, so its value isn't capital
+        # actually sitting in the account. Kept in every cycle's log line on
+        # purpose so it can't be missed/forgotten during live operation.
         logger.info(
             "cycle complete. strategy: cash=%.0f positions=%s equity=%.0f | "
-            "buy_and_hold: equity=%.0f | combined=%.0f",
+            "buy_and_hold[virtual, not real capital]: equity=%.0f | combined=%.0f",
             broker.get_cash_balance(), list(broker.get_positions().keys()), strategy_equity,
             bh_value, strategy_equity + bh_value,
         )
