@@ -242,5 +242,64 @@ class TestKisBrokerCashLedger(unittest.TestCase):
         self.assertEqual(self.broker.get_cash_balance(), 500_000.0)
 
 
+class TestKisBrokerCosts(unittest.TestCase):
+    """commission_pct/sell_tax_pct should shrink the ledger the same way
+    MockBroker's Portfolio applies them - see KisBroker._effective_price.
+    """
+
+    def setUp(self):
+        self.env_patcher = _env_patch()
+        self.env_patcher.start()
+        self.token_patcher = patch("broker.kis_auth.KisSession.get_access_token", return_value="fake-token")
+        self.token_patcher.start()
+        self.broker = KisBroker(
+            env="demo", watchlist=["005930.KS"], seed_capital=500_000.0,
+            commission_pct=1.0, sell_tax_pct=2.0,
+        )
+
+    def tearDown(self):
+        self.token_patcher.stop()
+        self.env_patcher.stop()
+
+    @patch("broker.kis_broker.requests.post")
+    def test_buy_debits_ledger_with_commission(self, mock_post):
+        mock_post.return_value = MagicMock(
+            status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "1"}}
+        )
+        self.broker.place_order("005930.KS", Signal.BUY, 1, 100.0)
+        # effective buy price = 100 * 1.01 = 101
+        self.assertAlmostEqual(self.broker.get_cash_balance(), 500_000.0 - 101.0)
+
+    @patch("broker.kis_auth.requests.get")
+    @patch("broker.kis_broker.requests.post")
+    def test_sell_credits_ledger_net_of_commission_and_tax(self, mock_post, mock_get):
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "rt_cd": "0",
+                "output1": [{"pdno": "005930", "hldg_qty": "1", "pchs_avg_pric": "100"}],
+                "output2": [{"dnca_tot_amt": "0"}],
+            },
+        )
+        mock_post.return_value = MagicMock(
+            status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "2"}}
+        )
+        result = self.broker.place_order("005930.KS", Signal.SELL, 1, 200.0)
+        # effective sell price = 200 * (1 - 0.01 - 0.02) = 194
+        self.assertAlmostEqual(self.broker.get_cash_balance(), 500_000.0 + 194.0)
+        self.assertAlmostEqual(result.realized_pnl, 194.0 - 100.0)
+
+    @patch("broker.kis_broker.requests.post")
+    def test_order_sent_to_kis_uses_raw_fill_price_not_effective_price(self, mock_post):
+        # our commission/tax model is local-only bookkeeping - KIS must
+        # still be sent the actual fill price, not a cost-adjusted one.
+        mock_post.return_value = MagicMock(
+            status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "1"}}
+        )
+        self.broker.place_order("005930.KS", Signal.BUY, 1, 100.0)
+        sent_body = mock_post.call_args.kwargs["json"]
+        self.assertEqual(sent_body["ORD_UNPR"], "100")
+
+
 if __name__ == "__main__":
     unittest.main()

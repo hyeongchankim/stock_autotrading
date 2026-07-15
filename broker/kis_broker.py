@@ -63,7 +63,14 @@ def _post_no_ambiguous_retry(url: str, headers: dict, json_body: dict, timeout: 
 
 
 class KisBroker(BrokerBase):
-    def __init__(self, env: str = "demo", watchlist: list[str] | None = None, seed_capital: float | None = None):
+    def __init__(
+        self,
+        env: str = "demo",
+        watchlist: list[str] | None = None,
+        seed_capital: float | None = None,
+        commission_pct: float = 0.0,
+        sell_tax_pct: float = 0.0,
+    ):
         """seed_capital, if given, switches get_cash_balance()/get_total_equity()
         to a locally tracked cash ledger scoped to that amount instead of the
         real account's actual balance (e.g. a fresh KIS demo account starts
@@ -77,17 +84,22 @@ class KisBroker(BrokerBase):
         Leave seed_capital=None to fall back to reading the real balance
         directly (e.g. for one-off account inspection).
 
-        The ledger doesn't account for KIS's own commission/tax, which the
-        real account deducts automatically - a small, one-directional drift
-        (ledger slightly optimistic) that's immaterial at KIS's fee rates
-        and self-corrects to failed-order-not-crash if it ever overshoots
-        (place_order still validates against the real account).
+        commission_pct/sell_tax_pct (percentages, e.g. 0.015 means 0.015%)
+        are applied to the ledger the same way MockBroker applies them to
+        its Portfolio - the real KIS account deducts its own fees
+        automatically regardless of what we compute here, this just keeps
+        the local ledger's approximation of "what the strategy sleeve
+        actually has to spend" from drifting away from it. Real orders are
+        still sent at the raw fill_price - KIS, not this ledger, decides
+        the account's real fees.
         """
         self.session = KisSession(env=env)
         # bare ticker -> full yfinance-style symbol, so get_positions() keys
         # match what the rest of the engine (watchlist strings) expects
         self._ticker_to_symbol = {_to_kis_ticker(s): s for s in (watchlist or [])}
         self._cash_ledger: float | None = seed_capital
+        self.commission_pct = commission_pct
+        self.sell_tax_pct = sell_tax_pct
 
     def ledger_to_dict(self) -> dict:
         """Snapshot for StateStore, so the local cash ledger survives across
@@ -164,6 +176,16 @@ class KisBroker(BrokerBase):
             raise RuntimeError(f"KIS price inquiry failed for {symbol}: {body.get('msg1')}")
         return float(body["output"]["stck_prpr"])
 
+    def _effective_price(self, side: Signal, fill_price: float) -> float:
+        """fill_price adjusted for commission_pct (both sides) and
+        sell_tax_pct (sell only) - mirrors MockBroker/Portfolio's cost
+        model, used only for the local ledger/realized_pnl approximation
+        (see __init__ docstring), never sent to KIS as the order price.
+        """
+        if side == Signal.BUY:
+            return fill_price * (1 + self.commission_pct / 100)
+        return fill_price * (1 - self.commission_pct / 100 - self.sell_tax_pct / 100)
+
     def place_order(
         self, symbol: str, side: Signal, quantity: int, price: float | None = None
     ) -> OrderResult:
@@ -180,7 +202,7 @@ class KisBroker(BrokerBase):
             tr_id = self.session.real_tr_id(_SELL_TR_ID_REAL)
             position = self.get_positions().get(symbol)
             if position is not None:
-                realized_pnl = (fill_price - position.avg_price) * quantity
+                realized_pnl = (self._effective_price(side, fill_price) - position.avg_price) * quantity
         else:
             return OrderResult(symbol, side, quantity, fill_price, False, "HOLD is not an order side")
 
@@ -212,8 +234,9 @@ class KisBroker(BrokerBase):
 
         order_no = result_body.get("output", {}).get("ODNO", "")
         if self._cash_ledger is not None:
+            effective_price = self._effective_price(side, fill_price)
             if side == Signal.BUY:
-                self._cash_ledger -= quantity * fill_price
+                self._cash_ledger -= quantity * effective_price
             else:
-                self._cash_ledger += quantity * fill_price
+                self._cash_ledger += quantity * effective_price
         return OrderResult(symbol, side, quantity, fill_price, True, f"filled (order_no={order_no})", realized_pnl)

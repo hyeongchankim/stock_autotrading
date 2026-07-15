@@ -223,9 +223,10 @@ python -m unittest discover tests
 - **엔진의 자연 신호를 통한 실주문 체결은 아직 못 봄** - `place_order()`를 직접 호출한 수동
   테스트로 주문 경로 자체는 확인했지만, 신호생성→리스크관리→주문실행 전체 파이프라인을 통해
   실제로 진입하는 걸 본 적은 없다. 지금 스케줄러가 돌고 있으니 며칠~몇 주 지켜보면서 확인 필요.
-- KIS 실주문 수수료/세금이 `KisBroker`의 로컬 현금 원장(`kis_cash_ledger`)에는 반영 안 됨
-  (`MockBroker`처럼 `commission_pct`/`sell_tax_pct`를 적용하지 않음 - KIS 수수료율 자체가 낮아
-  드리프트는 미미하지만, 장기간 누적되면 원장과 실제 잔고가 조금씩 벌어질 수 있음)
+- ~~KIS 실주문 수수료/세금이 로컬 현금 원장에는 반영 안 됨~~ → 완료: `KisBroker`도 `MockBroker`와
+  같은 방식으로 `costs.commission_pct`/`sell_tax_pct`를 로컬 원장(`kis_cash_ledger`)과
+  `realized_pnl` 계산에 적용함 (실제 KIS로 보내는 주문가는 그대로 raw fill_price - 이건 어디까지나
+  로컬 장부 근사치용). KIS의 실제 수수료 스케줄과 완전히 일치하진 않겠지만 드리프트를 크게 줄임.
 - **하이브리드 Buy&Hold 슬리브는 실전에서도 여전히 "가상 계산"일 뿐, 실제 매수가 아니다** - paper/live
   모드의 `BuyAndHoldSleeve`는 브로커에 절대 주문을 넣지 않는다 (KIS 계좌가 현금/포지션을 슬리브별로
   분리 못 하기 때문). 즉 계좌에 시드 전체(예: 100만원)를 입금해도 실제로 매수되는 건 전략 슬리브

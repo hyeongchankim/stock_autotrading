@@ -135,15 +135,17 @@ def build_broker(config: dict, seed_capital: float | None = None) -> BrokerBase:
     the account instead of the intended budget.
     """
     broker_cfg = config.get("broker", {})
+    costs_cfg = config.get("costs", {})
     if broker_cfg.get("provider") == "kis":
         kis_cfg = broker_cfg.get("kis", {})
         return KisBroker(
             env=kis_cfg.get("env", "demo"),
             watchlist=config["watchlist"],
             seed_capital=seed_capital,
+            commission_pct=costs_cfg.get("commission_pct", 0.0),
+            sell_tax_pct=costs_cfg.get("sell_tax_pct", 0.0),
         )
 
-    costs_cfg = config.get("costs", {})
     return MockBroker(
         seed_capital=seed_capital if seed_capital is not None else config["seed_capital"],
         commission_pct=costs_cfg.get("commission_pct", 0.0),
