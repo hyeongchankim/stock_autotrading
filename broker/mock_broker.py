@@ -11,15 +11,31 @@ from strategies.base import Signal
 
 
 class MockBroker(BrokerBase):
-    def __init__(self, seed_capital: float, commission_pct: float = 0.0, sell_tax_pct: float = 0.0):
+    def __init__(
+        self,
+        seed_capital: float,
+        commission_pct: float = 0.0,
+        sell_tax_pct: float = 0.0,
+        slippage_pct: float = 0.0,
+    ):
         """commission_pct is charged on both buy and sell; sell_tax_pct
         (e.g. Korean securities transaction tax) only on sell. Both are
         percentages (0.015 means 0.015%), applied to the fill price so the
         backtest reflects real trading costs instead of a frictionless ideal.
+
+        slippage_pct models the gap between the price a signal was
+        evaluated at and the price an order would actually fill at (spread,
+        market impact) - always applied against the trader (buys fill
+        higher, sells fill lower), same direction as commission_pct.
+        Defaults to 0.0 so it's opt-in: this repo's stop_loss_pct/
+        position_size_pct/hybrid split were all tuned via backtests with no
+        slippage modeled, so turning this on will shift those results and
+        is a deliberate choice for the caller to make, not a hidden default.
         """
         self.portfolio = Portfolio(seed_capital)
         self.commission_pct = commission_pct
         self.sell_tax_pct = sell_tax_pct
+        self.slippage_pct = slippage_pct
         self._prices: dict[str, float] = {}
         self.order_log: list[OrderResult] = []
 
@@ -52,7 +68,7 @@ class MockBroker(BrokerBase):
         fill_price = price if price is not None else self.get_current_price(symbol)
 
         if side == Signal.BUY:
-            effective_price = fill_price * (1 + self.commission_pct / 100)
+            effective_price = fill_price * (1 + self.commission_pct / 100 + self.slippage_pct / 100)
             cost = quantity * effective_price
             if cost > self.portfolio.cash:
                 result = OrderResult(symbol, side, quantity, fill_price, False, "insufficient cash")
@@ -65,7 +81,9 @@ class MockBroker(BrokerBase):
             if position is None or position.quantity < quantity:
                 result = OrderResult(symbol, side, quantity, fill_price, False, "insufficient position")
             else:
-                effective_price = fill_price * (1 - self.commission_pct / 100 - self.sell_tax_pct / 100)
+                effective_price = fill_price * (
+                    1 - self.commission_pct / 100 - self.sell_tax_pct / 100 - self.slippage_pct / 100
+                )
                 realized_pnl = self.portfolio.apply_sell(symbol, quantity, effective_price)
                 result = OrderResult(symbol, side, quantity, fill_price, True, "filled", realized_pnl)
 

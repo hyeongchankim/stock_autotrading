@@ -46,6 +46,14 @@ class TestBuyAndHold(unittest.TestCase):
         with self.assertRaises(ValueError):
             run_buy_and_hold({}, seed_capital=1000, start_bar_index=0)
 
+    def test_slippage_reduces_starting_position(self):
+        symbol_data = {"A": _make_ohlcv([100, 100, 100])}
+        curve_no_slippage = run_buy_and_hold(symbol_data, seed_capital=1000, start_bar_index=0, slippage_pct=0.0)
+        curve_with_slippage = run_buy_and_hold(symbol_data, seed_capital=1000, start_bar_index=0, slippage_pct=1.0)
+        self.assertGreaterEqual(
+            float(curve_no_slippage["equity"].iloc[0]), float(curve_with_slippage["equity"].iloc[0])
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,7 @@ def run_buy_and_hold(
     seed_capital: float,
     start_bar_index: int,
     commission_pct: float = 0.0,
+    slippage_pct: float = 0.0,
 ) -> pd.DataFrame:
     """Equal-weights seed_capital across symbol_data at the first trade date
     (same warmup offset the strategy backtest uses), holds to the end with
@@ -40,7 +41,7 @@ def run_buy_and_hold(
         if entry_date not in df.index:
             continue
         entry_price = float(df.loc[entry_date, "close"])
-        effective_price = entry_price * (1 + commission_pct / 100)
+        effective_price = entry_price * (1 + commission_pct / 100 + slippage_pct / 100)
         qty = int(allocation_per_symbol // effective_price)
         shares[symbol] = qty
         cash -= qty * effective_price

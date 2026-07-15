@@ -150,6 +150,7 @@ def build_broker(config: dict, seed_capital: float | None = None) -> BrokerBase:
         seed_capital=seed_capital if seed_capital is not None else config["seed_capital"],
         commission_pct=costs_cfg.get("commission_pct", 0.0),
         sell_tax_pct=costs_cfg.get("sell_tax_pct", 0.0),
+        slippage_pct=costs_cfg.get("slippage_pct", 0.0),
     )
 
 
@@ -293,6 +294,7 @@ def run_backtest(config: dict) -> None:
         seed_capital=strategy_seed,
         commission_pct=costs_cfg.get("commission_pct", 0.0),
         sell_tax_pct=costs_cfg.get("sell_tax_pct", 0.0),
+        slippage_pct=costs_cfg.get("slippage_pct", 0.0),
     )
     base_feed = YFinanceDataFeed()
     whale_cfg = config["strategies"]["trend_following"].get("whale_flow", {})
@@ -334,6 +336,7 @@ def run_backtest(config: dict) -> None:
         seed_capital=bh_seed if bh_seed > 0 else total_seed,
         start_bar_index=min_bars,
         commission_pct=costs_cfg.get("commission_pct", 0.0),
+        slippage_pct=costs_cfg.get("slippage_pct", 0.0),
     )
     bh_end_equity = float(bh_curve["equity"].iloc[-1])
     bh_seed_for_return = bh_seed if bh_seed > 0 else total_seed
