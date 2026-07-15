@@ -333,11 +333,39 @@ python -m unittest discover tests
 7. **스케줄러 재활성화는 맨 마지막**: `schtasks /change /tn "StockAutoTradingPaper" /enable`.
 8. **지속 모니터링**: `logs/trading.log`, `logs/scheduler_stdout_YYYY-MM-DD.log`를 매일
    확인한다. 실제 계좌 잔고와 로컬 `kis_cash_ledger`가 시간이 지나며 어긋나지 않는지 주기적으로
-   대사한다.
+   대사한다. 텔레그램 알림(아래 "알림" 섹션)을 설정해두면 진입/청산/일일 손실한도 도달/사이클
+   크래시를 로그를 직접 안 봐도 실시간으로 받을 수 있다 - 실전 전환 전에 설정해두는 걸 권장.
 9. **되돌리기(rollback) 계획**: 문제가 생기면 `schtasks /change /tn "StockAutoTradingPaper"
    /disable`로 먼저 멈추고, `config.yaml`의 `env`를 다시 `demo`로 되돌린다. 실전 포지션이
    열려있으면 HTS나 앱으로 직접 정리한다 - 자동화가 꺼진 상태에서 방치된 포지션은 코드가
    관리하지 않는다.
+
+## 알림 (텔레그램, 선택)
+
+`utils/notify.py`가 아래 이벤트를 텔레그램 메시지로 보낸다:
+- 진입/청산 체결 (paper/live 어느 쪽이든 - 메시지에 `[demo]`/`[real]`/`[mock]`으로 어느 계좌인지
+  항상 표시됨, 실제 돈인지 착각할 일 없게)
+- **청산 주문 실패** (`_check_protective_exit`/`_check_strategy_exit`) - 손절/익절이 실패하면
+  포지션이 관리 안 된 채로 열려있게 되므로 가장 위험한 이벤트. 진입 실패는 통지 안 함 (놓친
+  기회일 뿐, 다음 사이클에 다시 시도됨 - 덜 위급함)
+- `daily_max_loss_pct` 서킷브레이커가 새로 발동한 순간 (같은 날 이미 발동해있었다면 매 사이클
+  중복 통지 안 함)
+- `python main.py --mode paper` 사이클이 처리되지 않은 예외로 죽었을 때
+
+**설정**:
+1. 텔레그램에서 [@BotFather](https://t.me/BotFather)에게 `/newbot`으로 새 봇을 만들고 토큰을 받는다
+2. 만든 봇에게 아무 메시지나 한 번 보낸 뒤, 브라우저로
+   `https://api.telegram.org/bot<받은토큰>/getUpdates`에 접속해서 응답에서 `chat.id` 값을 찾는다
+3. 아래 환경변수를 본인 PC에 설정:
+   ```powershell
+   [System.Environment]::SetEnvironmentVariable("TELEGRAM_BOT_TOKEN", "받은 토큰", "User")
+   [System.Environment]::SetEnvironmentVariable("TELEGRAM_CHAT_ID", "찾은 chat id", "User")
+   ```
+4. 새 터미널(환경변수 반영)에서 실행하면 자동으로 알림이 나간다
+
+두 환경변수가 없으면 `send_notification()`은 조용히 아무것도 안 한다 (선택 기능이라 필수 아님,
+알림 전송 실패도 트레이딩 사이클을 절대 죽이지 않음 - 네트워크 오류든 인증 실패든 로그
+경고만 남기고 넘어감).
 
 ## 트러블슈팅: SSL 인증서 오류 (Windows + 한글 계정명)
 

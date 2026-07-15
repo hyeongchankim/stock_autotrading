@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from datetime import date
 from pathlib import Path
 
 import yaml
@@ -34,6 +35,7 @@ from strategies.trend_following import (
 from strategies.volume_filter import VolumeFilter
 from strategies.whale_flow import WhaleFlowStrategy
 from utils.logger import setup_logging
+from utils.notify import send_notification
 from utils.state_store import StateStore
 
 setup_logging()
@@ -228,6 +230,11 @@ def run_paper(config: dict) -> None:
     engine.risk_manager.restore(state.get("risk_manager", {}))
     if isinstance(broker, KisBroker):
         broker.restore_ledger(state.get("kis_cash_ledger", {}))
+    # roll_to_day here (redundant but harmless - run_once() does it again)
+    # so was_halted_today below reflects *today's* state, not a stale halt
+    # carried over from a previous day's restore().
+    engine.risk_manager.roll_to_day(date.today())
+    was_halted_today = engine.risk_manager.trading_halted_today
 
     # Fetched once here (rather than left to engine.run_once) so the same
     # day_prices can also mark-to-market the buy_and_hold sleeve below,
@@ -255,6 +262,12 @@ def run_paper(config: dict) -> None:
         "buy_and_hold": bh_sleeve.to_dict() if bh_sleeve else {},
         "kis_cash_ledger": broker.ledger_to_dict() if isinstance(broker, KisBroker) else {},
     })
+
+    if not was_halted_today and engine.risk_manager.trading_halted_today:
+        send_notification(
+            f"[stock_autotrading] daily_max_loss_pct 도달 - 오늘 신규 진입 중단됨 "
+            f"(realized_pnl={engine.risk_manager.daily_realized_pnl:.0f})"
+        )
 
     if bh_sleeve is not None:
         bh_value = bh_sleeve.current_value(day_prices)
@@ -382,7 +395,14 @@ def main() -> None:
     config = load_config(args.config)
 
     if args.mode == "paper":
-        run_paper(config)
+        # notified separately from run_backtest - this is the mode the
+        # scheduler runs unattended, so a silent crash would otherwise go
+        # unnoticed until someone thinks to check the logs.
+        try:
+            run_paper(config)
+        except Exception as exc:
+            send_notification(f"[stock_autotrading] paper cycle CRASHED: {exc}")
+            raise
     else:
         run_backtest(config)
 

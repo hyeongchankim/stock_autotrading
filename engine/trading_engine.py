@@ -36,8 +36,20 @@ from risk.risk_manager import RiskManager
 from strategies.base import Signal, Strategy
 from strategies.regime import RegimeFilter
 from strategies.volume_filter import VolumeFilter
+from utils.notify import send_notification
 
 logger = logging.getLogger("engine")
+
+
+def _broker_label(broker: BrokerBase) -> str:
+    """Distinguishes real-money orders from paper/demo/backtest ones in
+    notification text, so a Telegram message can never be mistaken for the
+    other. KisBroker exposes session.env ("demo"/"real"); anything else
+    (MockBroker, backtests) doesn't put real money at risk.
+    """
+    session = getattr(broker, "session", None)
+    env = getattr(session, "env", None)
+    return env if env in ("demo", "real") else "mock"
 
 
 @dataclass
@@ -140,6 +152,7 @@ class TradingEngine:
             return
 
         result = self.broker.place_order(symbol, Signal.SELL, position.quantity, current_price)
+        env = _broker_label(self.broker)
         if result.filled:
             self.risk_manager.record_realized_pnl(result.realized_pnl)
             self.risk_manager.clear_peak_price(symbol)
@@ -147,6 +160,16 @@ class TradingEngine:
                 "%s: %s exit, qty=%s price=%.2f pnl=%.2f",
                 symbol, trigger, result.quantity, result.price, result.realized_pnl,
             )
+            send_notification(
+                f"[{env}] {trigger} exit: {symbol} x{result.quantity} @ {result.price:.0f} "
+                f"pnl={result.realized_pnl:+.0f}"
+            )
+        else:
+            # a failed protective exit leaves the position open and
+            # unmanaged until the next cycle re-evaluates it - risk-
+            # critical enough to always surface, unlike a failed entry.
+            logger.warning("%s: %s exit FAILED - %s", symbol, trigger, result.message)
+            send_notification(f"[{env}] {trigger} exit FAILED: {symbol} - {result.message}")
 
     def _check_strategy_exit(self, symbol: str, ohlcv: pd.DataFrame, current_price: float) -> None:
         position = self.broker.get_positions().get(symbol)
@@ -159,6 +182,7 @@ class TradingEngine:
             return
 
         result = self.broker.place_order(symbol, Signal.SELL, position.quantity, current_price)
+        env = _broker_label(self.broker)
         if result.filled:
             self.risk_manager.record_realized_pnl(result.realized_pnl)
             self.risk_manager.clear_peak_price(symbol)
@@ -166,6 +190,13 @@ class TradingEngine:
                 "%s: strategy exit (%s), qty=%s price=%.2f pnl=%.2f",
                 symbol, sell_signals[0].strategy_name, result.quantity, result.price, result.realized_pnl,
             )
+            send_notification(
+                f"[{env}] strategy exit ({sell_signals[0].strategy_name}): {symbol} x{result.quantity} "
+                f"@ {result.price:.0f} pnl={result.realized_pnl:+.0f}"
+            )
+        else:
+            logger.warning("%s: strategy exit FAILED - %s", symbol, result.message)
+            send_notification(f"[{env}] strategy exit FAILED: {symbol} - {result.message}")
 
     def _find_entry_candidate(
         self, symbol: str, ohlcv: pd.DataFrame, current_price: float
@@ -230,3 +261,11 @@ class TradingEngine:
                 "%s: entry (%s), qty=%s price=%.2f",
                 candidate.symbol, candidate.strategy_names, result.quantity, result.price,
             )
+            send_notification(
+                f"[{_broker_label(self.broker)}] entry ({candidate.strategy_names}): "
+                f"{candidate.symbol} x{result.quantity} @ {result.price:.0f}"
+            )
+        else:
+            # not risk-critical the way a failed exit is (worst case: a
+            # missed entry, not an unmanaged open position) - log only.
+            logger.warning("%s: entry FAILED - %s", candidate.symbol, result.message)
