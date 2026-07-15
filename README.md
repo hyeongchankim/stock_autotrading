@@ -298,6 +298,47 @@ python -m unittest discover tests
 
 `strategies/`, `risk/`, `engine/`, `backtest/`는 브로커가 무엇이든 그대로 재사용된다.
 
+### 실전 전환 가이드
+
+`broker.kis.env`를 `demo`에서 `real`로 바꾸는 순간 실제 돈이 움직인다. Claude(또는 어떤 자동화
+도구)에게 이 전환 자체나 실주문 실행을 대신 시키지 말 것 - 아래 단계는 전부 사용자 본인이 직접
+수행해야 한다.
+
+0. **시작 전 최종 확인**: 위 "아직 안 된 것" 섹션을 한 번 더 읽는다. 이 문서 기준으로 유일하게
+   남은 미검증 항목은 **엔진의 자연 신호를 통한 실주문 체결**이다 - 지금까지는 `place_order()`를
+   직접 호출한 수동 테스트로 주문 경로만 확인했을 뿐, 신호생성→리스크관리→주문실행 전체
+   파이프라인이 실제로 진입까지 가는 걸 본 적이 없다. 모의투자로 최소 진입→청산 1사이클을
+   직접 본 뒤에 전환하는 걸 권장한다.
+1. **스케줄러부터 끈다** (가장 먼저):
+   ```powershell
+   schtasks /end /tn "StockAutoTradingPaper"      # 실행 중이면 중단
+   schtasks /change /tn "StockAutoTradingPaper" /disable
+   ```
+2. **실전 계좌·시드 정합성 확인**: 실전 계좌에 실제로 입금한 금액이 `config.yaml`의
+   `seed_capital`과 일치하는지 확인한다. 하이브리드를 쓴다면 `BuyAndHoldSleeve`는 실전에서도
+   가상 추적만 한다는 점을 다시 확인 - 나머지 절반을 진짜 분산투자하고 싶으면 직접 수동
+   매수하거나 `hybrid.enabled: false`로 순수 전략만 쓸지 미리 결정한다.
+3. **`state.json` 정리** (누락하기 쉬움): `kis_cash_ledger`는 모의투자로 누적된 가상 현금
+   값이다. `env`만 바꾸고 이 파일을 그대로 두면 로컬 원장이 실전 계좌의 실제 잔고와 전혀 다른
+   값에서 출발한다. 전환 직전에 `state.json`을 삭제하거나 최소한 `kis_cash_ledger`/
+   `buy_and_hold` 항목을 지운다 (`risk_manager`의 일일 카운터는 날짜가 바뀌면 자동 초기화되니
+   신경 안 써도 됨).
+4. **`config.yaml` 변경**: `broker.kis.env: demo` → `real`.
+5. **스케줄러 없이 수동으로 먼저 1회 실행**: `python main.py --mode paper` - 로그에서 실제
+   계좌 잔고/포지션이 정확히 읽히는지, `cash`가 기대한 시드와 맞는지 확인한다. 신호가 없어도
+   정상 - 파이프라인이 실전 계좌를 제대로 읽고 쓰는지만 확인하는 단계다.
+6. **며칠은 수동으로만 운영**: 장중 몇 차례 수동 실행하며 지켜본다. 실제 신호가 나서 진짜
+   주문이 나가는 순간 로그에 `PLACING REAL-MONEY ORDER` 경고가 찍힌다 - 이걸 직접 눈으로
+   확인한 뒤에 다음 단계로 넘어가는 걸 권한다.
+7. **스케줄러 재활성화는 맨 마지막**: `schtasks /change /tn "StockAutoTradingPaper" /enable`.
+8. **지속 모니터링**: `logs/trading.log`, `logs/scheduler_stdout_YYYY-MM-DD.log`를 매일
+   확인한다. 실제 계좌 잔고와 로컬 `kis_cash_ledger`가 시간이 지나며 어긋나지 않는지 주기적으로
+   대사한다.
+9. **되돌리기(rollback) 계획**: 문제가 생기면 `schtasks /change /tn "StockAutoTradingPaper"
+   /disable`로 먼저 멈추고, `config.yaml`의 `env`를 다시 `demo`로 되돌린다. 실전 포지션이
+   열려있으면 HTS나 앱으로 직접 정리한다 - 자동화가 꺼진 상태에서 방치된 포지션은 코드가
+   관리하지 않는다.
+
 ## 트러블슈팅: SSL 인증서 오류 (Windows + 한글 계정명)
 
 Windows 사용자 계정명에 한글이 포함되어 있으면(`C:\Users\김형찬(HyeongchanKim)\...`),
