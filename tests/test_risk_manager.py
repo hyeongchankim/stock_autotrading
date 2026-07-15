@@ -6,6 +6,7 @@ Run with: pytest
 from __future__ import annotations
 
 import unittest
+from datetime import date
 
 from risk.risk_manager import RiskManager
 
@@ -37,6 +38,36 @@ class TestRiskManager(unittest.TestCase):
         self.assertTrue(self.rm.can_open_new_position())
         self.rm.record_realized_pnl(-300_001)  # 30% of 1,000,000 seed
         self.assertFalse(self.rm.can_open_new_position())
+
+    def test_to_dict_restore_round_trip_same_day(self):
+        self.rm.roll_to_day(date(2026, 1, 2))
+        self.rm.record_realized_pnl(-50_000)
+
+        restored = RiskManager(seed_capital=1_000_000)
+        restored.restore(self.rm.to_dict())
+
+        self.assertEqual(restored.daily_realized_pnl, -50_000)
+        self.assertFalse(restored.trading_halted_today)
+        # restoring a same-day snapshot must survive the roll_to_day call
+        # run_once always makes at the start of a cycle
+        restored.roll_to_day(date(2026, 1, 2))
+        self.assertEqual(restored.daily_realized_pnl, -50_000)
+
+    def test_restore_stale_day_is_cleared_by_next_roll(self):
+        self.rm.roll_to_day(date(2026, 1, 2))
+        self.rm.record_realized_pnl(-300_001)  # halts trading that day
+
+        restored = RiskManager(seed_capital=1_000_000)
+        restored.restore(self.rm.to_dict())
+        restored.roll_to_day(date(2026, 1, 3))  # a new day - counters must reset
+
+        self.assertEqual(restored.daily_realized_pnl, 0.0)
+        self.assertTrue(restored.can_open_new_position())
+
+    def test_restore_empty_state_is_noop(self):
+        self.rm.restore({})
+        self.assertEqual(self.rm.daily_realized_pnl, 0.0)
+        self.assertFalse(self.rm.trading_halted_today)
 
 
 if __name__ == "__main__":

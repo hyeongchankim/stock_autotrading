@@ -5,3 +5,4 @@ venv/
 logs/*.log
 .env
 .kis_cache/
+state.json

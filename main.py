@@ -21,6 +21,7 @@ from data.kis_data_feed import KisDataFeed
 from data.krx_investor_feed import KrxInvestorFlowFeed, WhaleEnrichedDataFeed
 from data.yfinance_feed import YFinanceDataFeed
 from engine.trading_engine import TradingEngine
+from portfolio.buy_and_hold import BuyAndHoldSleeve
 from risk.risk_manager import RiskManager
 from strategies.mean_reversion import RSIStrategy, VolatilityBreakoutStrategy
 from strategies.regime import RegimeFilter
@@ -33,9 +34,12 @@ from strategies.trend_following import (
 from strategies.volume_filter import VolumeFilter
 from strategies.whale_flow import WhaleFlowStrategy
 from utils.logger import setup_logging
+from utils.state_store import StateStore
 
 setup_logging()
 logger = logging.getLogger("main")
+
+STATE_FILE = Path(__file__).parent / "state.json"
 
 
 def load_config(path: str) -> dict:
@@ -124,13 +128,20 @@ def build_regime_filter(config: dict) -> RegimeFilter | None:
 def build_broker(config: dict, seed_capital: float | None = None) -> BrokerBase:
     """Returns MockBroker unless broker.provider is "kis", in which case it
     connects to the real KIS account (see broker.kis.env - defaults to
-    demo/paper trading, never assume "real"). seed_capital is only
-    meaningful for MockBroker; a real broker reports its own actual balance.
+    demo/paper trading, never assume "real"). seed_capital scopes a local
+    cash ledger for KisBroker too (see KisBroker docstring) - the real
+    account's actual balance isn't tied to this bot's configured seed, so
+    without it position sizing would be based on whatever happens to be in
+    the account instead of the intended budget.
     """
     broker_cfg = config.get("broker", {})
     if broker_cfg.get("provider") == "kis":
         kis_cfg = broker_cfg.get("kis", {})
-        return KisBroker(env=kis_cfg.get("env", "demo"), watchlist=config["watchlist"])
+        return KisBroker(
+            env=kis_cfg.get("env", "demo"),
+            watchlist=config["watchlist"],
+            seed_capital=seed_capital,
+        )
 
     costs_cfg = config.get("costs", {})
     return MockBroker(
@@ -200,25 +211,61 @@ def strategy_allocation_pct(config: dict) -> float:
 
 
 def run_paper(config: dict) -> None:
+    total_seed = config["seed_capital"]
     alloc_pct = strategy_allocation_pct(config)
-    strategy_seed = config["seed_capital"] * alloc_pct
-
-    if alloc_pct < 1.0:
-        logger.warning(
-            "hybrid mode: paper/live tracking of the buy_and_hold sleeve is not implemented yet "
-            "(needs persistent state across runs) - only the %.0f%% strategy sleeve (seed=%.0f) runs here.",
-            alloc_pct * 100, strategy_seed,
-        )
+    strategy_seed = total_seed * alloc_pct
+    bh_seed = total_seed - strategy_seed
 
     broker = build_broker(config, seed_capital=strategy_seed)
     data_feed = build_data_feed(config)
     engine = build_engine(config, broker, data_feed, seed_capital=strategy_seed)
 
-    equity = engine.run_once()
-    logger.info(
-        "cycle complete. cash=%.0f positions=%s total_equity=%.0f",
-        broker.get_cash_balance(), list(broker.get_positions().keys()), equity,
-    )
+    store = StateStore(STATE_FILE)
+    state = store.load()
+    engine.risk_manager.restore(state.get("risk_manager", {}))
+    if isinstance(broker, KisBroker):
+        broker.restore_ledger(state.get("kis_cash_ledger", {}))
+
+    # Fetched once here (rather than left to engine.run_once) so the same
+    # day_prices can also mark-to-market the buy_and_hold sleeve below,
+    # without a second round of API calls per symbol.
+    windows = {}
+    for symbol in config["watchlist"]:
+        try:
+            windows[symbol] = data_feed.get_ohlcv(
+                symbol, config["data_feed"]["interval"], config["data_feed"]["lookback_days"]
+            )
+        except Exception as exc:
+            logger.warning("skipping %s: failed to fetch data (%s)", symbol, exc)
+    day_prices = {symbol: float(df["close"].iloc[-1]) for symbol, df in windows.items()}
+
+    bh_sleeve = None
+    if bh_seed > 0:
+        bh_sleeve = BuyAndHoldSleeve(seed_capital=bh_seed, watchlist=config["watchlist"])
+        bh_sleeve.restore(state.get("buy_and_hold", {}))
+        bh_sleeve.ensure_purchased(day_prices)
+
+    strategy_equity = engine.run_once(precomputed_windows=windows)
+
+    store.save({
+        "risk_manager": engine.risk_manager.to_dict(),
+        "buy_and_hold": bh_sleeve.to_dict() if bh_sleeve else {},
+        "kis_cash_ledger": broker.ledger_to_dict() if isinstance(broker, KisBroker) else {},
+    })
+
+    if bh_sleeve is not None:
+        bh_value = bh_sleeve.current_value(day_prices)
+        logger.info(
+            "cycle complete. strategy: cash=%.0f positions=%s equity=%.0f | "
+            "buy_and_hold: equity=%.0f | combined=%.0f",
+            broker.get_cash_balance(), list(broker.get_positions().keys()), strategy_equity,
+            bh_value, strategy_equity + bh_value,
+        )
+    else:
+        logger.info(
+            "cycle complete. cash=%.0f positions=%s total_equity=%.0f",
+            broker.get_cash_balance(), list(broker.get_positions().keys()), strategy_equity,
+        )
 
 
 def run_backtest(config: dict) -> None:

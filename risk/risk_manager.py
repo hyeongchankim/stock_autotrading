@@ -76,3 +76,29 @@ class RiskManager:
         self.daily_realized_pnl += pnl
         if self.daily_realized_pnl <= -self.daily_max_loss_amount:
             self.trading_halted_today = True
+
+    def to_dict(self) -> dict:
+        """Snapshot of today's counters, for StateStore to persist across
+        separate process runs (a single `python main.py --mode paper`
+        invocation has no memory of earlier runs the same day otherwise, so
+        the daily loss halt would never actually trigger under a scheduler).
+        """
+        return {
+            "date": self._current_day.isoformat() if self._current_day else None,
+            "daily_realized_pnl": self.daily_realized_pnl,
+            "trading_halted_today": self.trading_halted_today,
+        }
+
+    def restore(self, state: dict) -> None:
+        """Loads a snapshot from to_dict. Safe to call with {} (no-op). If the
+        saved date isn't today, the stale counters are still loaded here but
+        the next roll_to_day call (always made at the start of run_once)
+        resets them before anything reads them - so callers don't need to
+        check the date themselves.
+        """
+        date_str = state.get("date")
+        if not date_str:
+            return
+        self._current_day = date.fromisoformat(date_str)
+        self.daily_realized_pnl = state.get("daily_realized_pnl", 0.0)
+        self.trading_halted_today = state.get("trading_halted_today", False)

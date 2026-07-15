@@ -171,5 +171,76 @@ class TestKisBroker(unittest.TestCase):
         self.assertEqual(mock_post.call_count, 1)
 
 
+class TestKisBrokerCashLedger(unittest.TestCase):
+    """Without seed_capital, get_cash_balance() must keep reading the real
+    account (covered by TestKisBroker above, which never passes it) - these
+    cover the opt-in local ledger used to scope position sizing to the
+    configured seed instead of the real account's actual balance.
+    """
+
+    def setUp(self):
+        self.env_patcher = _env_patch()
+        self.env_patcher.start()
+        self.token_patcher = patch("broker.kis_auth.KisSession.get_access_token", return_value="fake-token")
+        self.token_patcher.start()
+        self.broker = KisBroker(env="demo", watchlist=["005930.KS"], seed_capital=500_000.0)
+
+    def tearDown(self):
+        self.token_patcher.stop()
+        self.env_patcher.stop()
+
+    @patch("broker.kis_auth.requests.get")
+    def test_seed_capital_ignores_real_account_balance(self, mock_get):
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"rt_cd": "0", "output1": [], "output2": [{"dnca_tot_amt": "10000000"}]},
+        )
+        self.assertEqual(self.broker.get_cash_balance(), 500_000.0)
+        mock_get.assert_not_called()  # ledger short-circuits the balance API call entirely
+
+    @patch("broker.kis_broker.requests.post")
+    def test_place_order_buy_debits_ledger(self, mock_post):
+        mock_post.return_value = MagicMock(
+            status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "1"}}
+        )
+        self.broker.place_order("005930.KS", Signal.BUY, 2, 70000.0)
+        self.assertEqual(self.broker.get_cash_balance(), 500_000.0 - 2 * 70000.0)
+
+    @patch("broker.kis_auth.requests.get")
+    @patch("broker.kis_broker.requests.post")
+    def test_place_order_sell_credits_ledger(self, mock_post, mock_get):
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "rt_cd": "0",
+                "output1": [{"pdno": "005930", "hldg_qty": "2", "pchs_avg_pric": "70000"}],
+                "output2": [{"dnca_tot_amt": "0"}],
+            },
+        )
+        mock_post.return_value = MagicMock(
+            status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "2"}}
+        )
+        self.broker.place_order("005930.KS", Signal.SELL, 2, 75000.0)
+        self.assertEqual(self.broker.get_cash_balance(), 500_000.0 + 2 * 75000.0)
+
+    @patch("broker.kis_broker.requests.post")
+    def test_failed_order_does_not_touch_ledger(self, mock_post):
+        mock_post.return_value = MagicMock(
+            status_code=200, json=lambda: {"rt_cd": "1", "msg1": "insufficient balance"}
+        )
+        self.broker.place_order("005930.KS", Signal.BUY, 1, 70000.0)
+        self.assertEqual(self.broker.get_cash_balance(), 500_000.0)
+
+    def test_ledger_to_dict_restore_round_trip(self):
+        snapshot = {"cash": 123456.0}
+        self.broker.restore_ledger(snapshot)
+        self.assertEqual(self.broker.get_cash_balance(), 123456.0)
+        self.assertEqual(self.broker.ledger_to_dict(), snapshot)
+
+    def test_restore_ledger_empty_state_is_noop(self):
+        self.broker.restore_ledger({})
+        self.assertEqual(self.broker.get_cash_balance(), 500_000.0)
+
+
 if __name__ == "__main__":
     unittest.main()

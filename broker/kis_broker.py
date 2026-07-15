@@ -63,11 +63,42 @@ def _post_no_ambiguous_retry(url: str, headers: dict, json_body: dict, timeout: 
 
 
 class KisBroker(BrokerBase):
-    def __init__(self, env: str = "demo", watchlist: list[str] | None = None):
+    def __init__(self, env: str = "demo", watchlist: list[str] | None = None, seed_capital: float | None = None):
+        """seed_capital, if given, switches get_cash_balance()/get_total_equity()
+        to a locally tracked cash ledger scoped to that amount instead of the
+        real account's actual balance (e.g. a fresh KIS demo account starts
+        with its own default balance, unrelated to this bot's configured
+        seed_capital - without this, RiskManager.calc_position_size would
+        size positions off that real balance and massively overshoot what
+        was backtested). Positions/avg_price still always come from the real
+        account, which stays accurate as long as nothing outside this bot's
+        own BUY/SELL calls touches it - the hybrid buy_and_hold sleeve is
+        local-only and never places real orders (portfolio/buy_and_hold.py).
+        Leave seed_capital=None to fall back to reading the real balance
+        directly (e.g. for one-off account inspection).
+
+        The ledger doesn't account for KIS's own commission/tax, which the
+        real account deducts automatically - a small, one-directional drift
+        (ledger slightly optimistic) that's immaterial at KIS's fee rates
+        and self-corrects to failed-order-not-crash if it ever overshoots
+        (place_order still validates against the real account).
+        """
         self.session = KisSession(env=env)
         # bare ticker -> full yfinance-style symbol, so get_positions() keys
         # match what the rest of the engine (watchlist strings) expects
         self._ticker_to_symbol = {_to_kis_ticker(s): s for s in (watchlist or [])}
+        self._cash_ledger: float | None = seed_capital
+
+    def ledger_to_dict(self) -> dict:
+        """Snapshot for StateStore, so the local cash ledger survives across
+        separate process runs. Empty when no seed_capital was configured.
+        """
+        return {"cash": self._cash_ledger} if self._cash_ledger is not None else {}
+
+    def restore_ledger(self, state: dict) -> None:
+        if self._cash_ledger is None or not state:
+            return
+        self._cash_ledger = state.get("cash", self._cash_ledger)
 
     def _resolve_symbol(self, bare_ticker: str) -> str:
         return self._ticker_to_symbol.get(bare_ticker, bare_ticker)
@@ -103,6 +134,8 @@ class KisBroker(BrokerBase):
         return body.get("output1", []), body.get("output2", [{}])
 
     def get_cash_balance(self) -> float:
+        if self._cash_ledger is not None:
+            return self._cash_ledger
         _holdings, summary = self._inquire_balance()
         if not summary:
             return 0.0
@@ -178,4 +211,9 @@ class KisBroker(BrokerBase):
             return OrderResult(symbol, side, quantity, fill_price, False, result_body.get("msg1", "order failed"))
 
         order_no = result_body.get("output", {}).get("ODNO", "")
+        if self._cash_ledger is not None:
+            if side == Signal.BUY:
+                self._cash_ledger -= quantity * fill_price
+            else:
+                self._cash_ledger += quantity * fill_price
         return OrderResult(symbol, side, quantity, fill_price, True, f"filled (order_no={order_no})", realized_pnl)
