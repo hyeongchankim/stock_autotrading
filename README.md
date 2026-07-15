@@ -266,9 +266,15 @@ python -m unittest discover tests
   **사용자가 직접 수동으로 매수**해야 한다 - config.yaml `hybrid` 섹션에도 같은 경고가 있다.
 - tr_id 코드가 KIS 모의투자 실계좌 호출로는 검증됐지만(매수/매도 둘 다 정상 체결), 최신 KIS
   공식 문서와의 재대조는 아직 권장 수준으로 남아있음.
-- `daily_max_loss_pct` 서킷브레이커가 자연 발생 손실로 실제 작동하는 걸 본 적 없음 (유닛
-  테스트로만 검증) - `state.json`이 삭제/손상되면 당일 손실 누적이 초기화되어 서킷브레이커가
-  무력화될 수 있다는 점도 인지 필요.
+- ~~`daily_max_loss_pct` 서킷브레이커가 실제 손실로 검증된 적 없음~~ → 완료: KIS 모의투자
+  계좌에서 실제로 20주를 사서 시장가보다 25% 낮은 가격(밴드 내)에 팔아 실손실(-172,000원)을
+  발생시키고, config.yaml과 동일하게 스코프된 `RiskManager`(seed=50만원,
+  daily_max_loss_pct=30% → 한도 15만원)에 넣어 정상적으로 거래정지되는 것 확인. `to_dict()`/
+  `restore()` 왕복으로 프로세스 재시작 시나리오까지 통과 (halt 상태 유지됨) - `main.py`가
+  실제로 쓰는 영속화 경로와 동일. 보호성 청산(`_check_protective_exit`/`_check_strategy_exit`)은
+  `can_open_new_position()`을 호출하지 않으므로 거래정지 중에도 청산은 계속 허용됨(엔진 코드
+  확인). 여전히 남은 리스크: `state.json`이 삭제/손상되면 당일 손실 누적이 초기화되어
+  서킷브레이커가 무력화될 수 있음.
 - ~~로그 로테이션이 없음~~ → 완료: `utils/logger.py`가 `trading.log`에 `TimedRotatingFileHandler`
   (자정 회전, 30일 보관)를 적용. `run_paper_cycle.bat`가 캡처하는 stdout(pykrx 등 라이브러리의
   `print()` 기반 메시지 - 파이썬 logging으로는 못 잡음)은 날짜별 파일(`scheduler_stdout_YYYY-MM-DD.log`)로
