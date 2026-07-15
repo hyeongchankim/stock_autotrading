@@ -249,8 +249,11 @@ python -m unittest discover tests
 - `daily_max_loss_pct` 서킷브레이커가 자연 발생 손실로 실제 작동하는 걸 본 적 없음 (유닛
   테스트로만 검증) - `state.json`이 삭제/손상되면 당일 손실 누적이 초기화되어 서킷브레이커가
   무력화될 수 있다는 점도 인지 필요.
-- `logs/trading.log`, `logs/scheduler_stdout.log`에 로그 로테이션이 없음 - 장기 운영 시 계속
-  누적됨.
+- ~~로그 로테이션이 없음~~ → 완료: `utils/logger.py`가 `trading.log`에 `TimedRotatingFileHandler`
+  (자정 회전, 30일 보관)를 적용. `run_paper_cycle.bat`가 캡처하는 stdout(pykrx 등 라이브러리의
+  `print()` 기반 메시지 - 파이썬 logging으로는 못 잡음)은 날짜별 파일(`scheduler_stdout_YYYY-MM-DD.log`)로
+  나눠 쓰고, 실행할 때마다 `forfiles`로 30일 지난 파일을 정리함. 예전 누적 파일
+  `logs/scheduler_stdout.log`는 그대로 남아있지만 더 이상 커지지 않음.
 
 `strategies/`, `risk/`, `engine/`, `backtest/`는 브로커가 무엇이든 그대로 재사용된다.
 
