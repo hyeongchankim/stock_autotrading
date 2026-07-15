@@ -21,6 +21,7 @@ import requests
 
 from broker.base import BrokerBase, OrderResult
 from broker.kis_auth import KisSession, get_with_retry
+from broker.krx_tick import round_to_tick
 from portfolio.portfolio import Position
 from strategies.base import Signal
 
@@ -193,7 +194,7 @@ class KisBroker(BrokerBase):
             return OrderResult(symbol, side, quantity, price or 0.0, False, "quantity must be positive")
 
         ticker = _to_kis_ticker(symbol)
-        fill_price = price if price is not None else self.get_current_price(symbol)
+        fill_price = round_to_tick(price if price is not None else self.get_current_price(symbol))
         realized_pnl = 0.0
 
         if side == Signal.BUY:

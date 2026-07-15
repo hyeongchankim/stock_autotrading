@@ -134,6 +134,19 @@ class TestKisBroker(unittest.TestCase):
         self.assertEqual(sent_headers["tr_id"], "VTTC0802U")  # demo buy tr_id
 
     @patch("broker.kis_broker.requests.post")
+    def test_place_order_rounds_price_to_valid_krx_tick(self, mock_post):
+        mock_post.return_value = MagicMock(
+            status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "1"}}
+        )
+        # 70,034 is not a valid 100-won-tier price - must round to 70,000
+        # before it's sent to KIS, or the order would be rejected off-tick.
+        result = self.broker.place_order("005930.KS", Signal.BUY, 1, 70034.0)
+        self.assertEqual(result.price, 70000.0)
+
+        sent_body = mock_post.call_args.kwargs["json"]
+        self.assertEqual(sent_body["ORD_UNPR"], "70000")
+
+    @patch("broker.kis_broker.requests.post")
     def test_place_order_rejects_non_positive_quantity(self, mock_post):
         result = self.broker.place_order("005930.KS", Signal.BUY, 0, 70000.0)
         self.assertFalse(result.filled)
