@@ -276,6 +276,37 @@ class KisBroker(BrokerBase):
             return fill_price * (1 + self.commission_pct / 100)
         return fill_price * (1 - self.commission_pct / 100 - self.sell_tax_pct / 100)
 
+    def _actual_sold_qty(self, symbol: str, pre_qty: int, requested_qty: int) -> int:
+        """After KIS accepts a SELL order (rt_cd="0"), the account's own
+        position may take a few seconds to reflect the fill - observed
+        empirically this session (get_positions() sometimes lagged 3-10+
+        seconds behind a just-filled order). Polls briefly for the held
+        quantity to actually drop; if it never does within the retry
+        budget, falls back to requested_qty (assume it fully filled) rather
+        than reporting 0 - a stale read would otherwise make a real fill
+        look like nothing happened, which is worse for RiskManager's
+        realized_pnl tracking than the pre-existing (also imperfect)
+        assume-it-fully-filled behavior.
+
+        This exists because place_order() previously computed realized_pnl
+        off the requested quantity regardless of how much actually filled -
+        a stop-loss SELL that only partially fills would have recorded a
+        too-large realized loss, corrupting the daily_max_loss_pct circuit
+        breaker's accuracy. Scoped to SELL only: a partially-filled BUY
+        just means a smaller position, which self-corrects next cycle via
+        the engine's normal get_positions() read and isn't risk-critical
+        the way realized P&L accounting is.
+        """
+        for attempt in range(_MAX_RETRIES):
+            post_position = self.get_positions().get(symbol)
+            post_qty = post_position.quantity if post_position else 0
+            sold = pre_qty - post_qty
+            if sold > 0:
+                return min(sold, requested_qty)
+            if attempt < _MAX_RETRIES - 1:
+                time.sleep(_RETRY_BACKOFF_SECONDS)
+        return requested_qty
+
     def place_order(
         self, symbol: str, side: Signal, quantity: int, price: float | None = None
     ) -> OrderResult:
@@ -284,15 +315,13 @@ class KisBroker(BrokerBase):
 
         ticker = _to_kis_ticker(symbol)
         fill_price = round_to_tick(price if price is not None else self.get_current_price(symbol))
-        realized_pnl = 0.0
+        pre_position: Position | None = None
 
         if side == Signal.BUY:
             tr_id = self.session.real_tr_id(_BUY_TR_ID_REAL)
         elif side == Signal.SELL:
             tr_id = self.session.real_tr_id(_SELL_TR_ID_REAL)
-            position = self.get_positions().get(symbol)
-            if position is not None:
-                realized_pnl = (self._effective_price(side, fill_price) - position.avg_price) * quantity
+            pre_position = self.get_positions().get(symbol)
         else:
             return OrderResult(symbol, side, quantity, fill_price, False, "HOLD is not an order side")
 
@@ -323,10 +352,17 @@ class KisBroker(BrokerBase):
             return OrderResult(symbol, side, quantity, fill_price, False, result_body.get("msg1", "order failed"))
 
         order_no = result_body.get("output", {}).get("ODNO", "")
+        actual_qty = quantity
+        realized_pnl = 0.0
+        if side == Signal.SELL and pre_position is not None:
+            actual_qty = self._actual_sold_qty(symbol, pre_position.quantity, quantity)
+            realized_pnl = (self._effective_price(side, fill_price) - pre_position.avg_price) * actual_qty
+
         if self._cash_ledger is not None:
             effective_price = self._effective_price(side, fill_price)
             if side == Signal.BUY:
-                self._cash_ledger -= quantity * effective_price
+                self._cash_ledger -= actual_qty * effective_price
             else:
-                self._cash_ledger += quantity * effective_price
-        return OrderResult(symbol, side, quantity, fill_price, True, f"filled (order_no={order_no})", realized_pnl)
+                self._cash_ledger += actual_qty * effective_price
+
+        return OrderResult(symbol, side, actual_qty, fill_price, True, f"filled (order_no={order_no})", realized_pnl)

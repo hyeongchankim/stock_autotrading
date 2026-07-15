@@ -258,7 +258,9 @@ class TestKisBrokerCashLedger(unittest.TestCase):
     @patch("broker.kis_auth.requests.get")
     @patch("broker.kis_broker.requests.post")
     def test_place_order_sell_credits_ledger(self, mock_post, mock_get):
-        mock_get.return_value = MagicMock(
+        # pre-order balance check sees 2 held, post-order check (inside
+        # _actual_sold_qty) sees 0 - a full fill, resolved on the first poll.
+        pre_order = MagicMock(
             status_code=200,
             json=lambda: {
                 "rt_cd": "0",
@@ -266,6 +268,11 @@ class TestKisBrokerCashLedger(unittest.TestCase):
                 "output2": [{"dnca_tot_amt": "0"}],
             },
         )
+        post_order = MagicMock(
+            status_code=200,
+            json=lambda: {"rt_cd": "0", "output1": [], "output2": [{"dnca_tot_amt": "0"}]},
+        )
+        mock_get.side_effect = [pre_order, post_order]
         mock_post.return_value = MagicMock(
             status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "2"}}
         )
@@ -322,7 +329,7 @@ class TestKisBrokerCosts(unittest.TestCase):
     @patch("broker.kis_auth.requests.get")
     @patch("broker.kis_broker.requests.post")
     def test_sell_credits_ledger_net_of_commission_and_tax(self, mock_post, mock_get):
-        mock_get.return_value = MagicMock(
+        pre_order = MagicMock(
             status_code=200,
             json=lambda: {
                 "rt_cd": "0",
@@ -330,6 +337,11 @@ class TestKisBrokerCosts(unittest.TestCase):
                 "output2": [{"dnca_tot_amt": "0"}],
             },
         )
+        post_order = MagicMock(
+            status_code=200,
+            json=lambda: {"rt_cd": "0", "output1": [], "output2": [{"dnca_tot_amt": "0"}]},
+        )
+        mock_get.side_effect = [pre_order, post_order]
         mock_post.return_value = MagicMock(
             status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "2"}}
         )
@@ -409,6 +421,102 @@ class TestKisBrokerDailyFills(unittest.TestCase):
         )
         with self.assertRaises(RuntimeError):
             self.broker.get_daily_fills()
+
+
+class TestKisBrokerPartialFill(unittest.TestCase):
+    """place_order() previously computed realized_pnl and the local ledger
+    off the requested SELL quantity regardless of how much actually
+    filled - a partially-filled stop-loss SELL would have recorded a
+    too-large realized loss, corrupting the daily_max_loss_pct circuit
+    breaker's accuracy. _actual_sold_qty() fixes this by diffing
+    get_positions() before/after the order.
+    """
+
+    def setUp(self):
+        self.env_patcher = _env_patch()
+        self.env_patcher.start()
+        self.token_patcher = patch("broker.kis_auth.KisSession.get_access_token", return_value="fake-token")
+        self.token_patcher.start()
+        self.broker = KisBroker(env="demo", watchlist=["005930.KS"])
+
+    def tearDown(self):
+        self.token_patcher.stop()
+        self.env_patcher.stop()
+
+    @patch("broker.kis_auth.requests.get")
+    @patch("broker.kis_broker.requests.post")
+    def test_partial_fill_uses_actual_sold_qty_not_requested(self, mock_post, mock_get):
+        # requested 10, but only 3 actually sold - held quantity only drops 10->7
+        pre_order = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "rt_cd": "0",
+                "output1": [{"pdno": "005930", "hldg_qty": "10", "pchs_avg_pric": "100"}],
+                "output2": [{"dnca_tot_amt": "0"}],
+            },
+        )
+        post_order = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "rt_cd": "0",
+                "output1": [{"pdno": "005930", "hldg_qty": "7", "pchs_avg_pric": "100"}],
+                "output2": [{"dnca_tot_amt": "0"}],
+            },
+        )
+        mock_get.side_effect = [pre_order, post_order]
+        mock_post.return_value = MagicMock(
+            status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "1"}}
+        )
+        result = self.broker.place_order("005930.KS", Signal.SELL, 10, 150.0)
+        self.assertEqual(result.quantity, 3)  # actual fill, not the requested 10
+        self.assertAlmostEqual(result.realized_pnl, (150.0 - 100.0) * 3)  # not * 10
+
+    @patch("broker.kis_broker.time.sleep")
+    @patch("broker.kis_auth.requests.get")
+    @patch("broker.kis_broker.requests.post")
+    def test_falls_back_to_requested_qty_if_position_never_updates(self, mock_post, mock_get, _mock_sleep):
+        # get_positions() keeps reporting the pre-order quantity on every
+        # poll (simulates the account never reflecting the fill in time) -
+        # must fall back to assuming the requested quantity filled, not 0.
+        stale = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "rt_cd": "0",
+                "output1": [{"pdno": "005930", "hldg_qty": "5", "pchs_avg_pric": "100"}],
+                "output2": [{"dnca_tot_amt": "0"}],
+            },
+        )
+        mock_get.return_value = stale
+        mock_post.return_value = MagicMock(
+            status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "1"}}
+        )
+        result = self.broker.place_order("005930.KS", Signal.SELL, 5, 150.0)
+        self.assertEqual(result.quantity, 5)
+        self.assertAlmostEqual(result.realized_pnl, (150.0 - 100.0) * 5)
+
+    @patch("broker.kis_auth.requests.get")
+    @patch("broker.kis_broker.requests.post")
+    def test_diff_larger_than_requested_is_capped(self, mock_post, mock_get):
+        # defensive: even if the diff somehow exceeds what was requested
+        # (e.g. a concurrent manual trade), never report more than requested.
+        pre_order = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "rt_cd": "0",
+                "output1": [{"pdno": "005930", "hldg_qty": "10", "pchs_avg_pric": "100"}],
+                "output2": [{"dnca_tot_amt": "0"}],
+            },
+        )
+        post_order = MagicMock(
+            status_code=200,
+            json=lambda: {"rt_cd": "0", "output1": [], "output2": [{"dnca_tot_amt": "0"}]},
+        )
+        mock_get.side_effect = [pre_order, post_order]
+        mock_post.return_value = MagicMock(
+            status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "1"}}
+        )
+        result = self.broker.place_order("005930.KS", Signal.SELL, 3, 150.0)
+        self.assertEqual(result.quantity, 3)  # capped at requested, not the full 10 sold
 
 
 if __name__ == "__main__":
