@@ -307,6 +307,36 @@ class KisBroker(BrokerBase):
                 time.sleep(_RETRY_BACKOFF_SECONDS)
         return requested_qty
 
+    def _actual_bought_qty(self, symbol: str, pre_qty: int, requested_qty: int) -> int:
+        """BUY counterpart to _actual_sold_qty, with the opposite timeout
+        fallback. A 지정가(limit) BUY order can sit fully unfilled for far
+        longer than the retry budget here - confirmed manually (a forced
+        test order sat at filled_qty=0 for 10+ minutes on the demo account,
+        see get_daily_fills()'s docstring) - not just the few-second lag
+        _actual_sold_qty was written for.
+
+        _actual_sold_qty falls back to assuming a full fill on timeout,
+        deliberately, to protect realized_pnl/circuit-breaker accuracy. That
+        tradeoff doesn't apply here: assuming a BUY filled when it actually
+        didn't would silently debit the local cash ledger for shares never
+        purchased, and unlike position tracking (always re-read fresh from
+        KIS via get_positions()), the cash ledger is pure local bookkeeping
+        that's never reconciled against the real account - a wrong
+        deduction here persists across every future cycle until someone
+        notices and manually fixes state.json. Assuming 0 filled instead
+        just means a missed entry this cycle, which is safe: it self-
+        corrects next cycle the same way an unfilled SELL eventually would.
+        """
+        for attempt in range(_MAX_RETRIES):
+            post_position = self.get_positions().get(symbol)
+            post_qty = post_position.quantity if post_position else 0
+            bought = post_qty - pre_qty
+            if bought > 0:
+                return min(bought, requested_qty)
+            if attempt < _MAX_RETRIES - 1:
+                time.sleep(_RETRY_BACKOFF_SECONDS)
+        return 0
+
     def place_order(
         self, symbol: str, side: Signal, quantity: int, price: float | None = None
     ) -> OrderResult:
@@ -315,15 +345,16 @@ class KisBroker(BrokerBase):
 
         ticker = _to_kis_ticker(symbol)
         fill_price = round_to_tick(price if price is not None else self.get_current_price(symbol))
-        pre_position: Position | None = None
 
         if side == Signal.BUY:
             tr_id = self.session.real_tr_id(_BUY_TR_ID_REAL)
         elif side == Signal.SELL:
             tr_id = self.session.real_tr_id(_SELL_TR_ID_REAL)
-            pre_position = self.get_positions().get(symbol)
         else:
             return OrderResult(symbol, side, quantity, fill_price, False, "HOLD is not an order side")
+        # captured for both sides now (previously SELL-only): BUY needs its
+        # own pre-order quantity to detect an actual fill via _actual_bought_qty
+        pre_position = self.get_positions().get(symbol)
 
         if self.session.env == "real":
             logger.warning(
@@ -352,11 +383,21 @@ class KisBroker(BrokerBase):
             return OrderResult(symbol, side, quantity, fill_price, False, result_body.get("msg1", "order failed"))
 
         order_no = result_body.get("output", {}).get("ODNO", "")
+        pre_qty = pre_position.quantity if pre_position else 0
         actual_qty = quantity
         realized_pnl = 0.0
-        if side == Signal.SELL and pre_position is not None:
-            actual_qty = self._actual_sold_qty(symbol, pre_position.quantity, quantity)
+        if side == Signal.BUY:
+            actual_qty = self._actual_bought_qty(symbol, pre_qty, quantity)
+        elif pre_position is not None:
+            actual_qty = self._actual_sold_qty(symbol, pre_qty, quantity)
             realized_pnl = (self._effective_price(side, fill_price) - pre_position.avg_price) * actual_qty
+
+        if actual_qty <= 0:
+            return OrderResult(
+                symbol, side, 0, fill_price, False,
+                f"order accepted but not filled yet (order_no={order_no}) - "
+                "may still fill later, check get_daily_fills()",
+            )
 
         if self._cash_ledger is not None:
             effective_price = self._effective_price(side, fill_price)

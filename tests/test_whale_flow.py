@@ -71,11 +71,29 @@ class TestWhaleFlowStrategy(unittest.TestCase):
         result = strategy.generate_signal("TEST", ohlcv)
         self.assertEqual(result.signal, Signal.SELL)
 
-    def test_holds_when_flow_data_has_nan_in_window(self):
+    def test_todays_unconfirmed_nan_row_does_not_block_signal(self):
+        # institutional/foreign net-buy data is confirmed by KRX with a lag,
+        # so today's row is reliably NaN during market hours - the window
+        # must anchor on the last CONFIRMED rows instead of holding just
+        # because the most recent row hasn't settled yet.
         ohlcv = _make_ohlcv([100] * 10)
         ohlcv["institutional_net"] = 50_000
         ohlcv["foreign_net"] = 50_000
+        ohlcv.loc[ohlcv.index[-1], "institutional_net"] = np.nan
         ohlcv.loc[ohlcv.index[-1], "foreign_net"] = np.nan
+        strategy = WhaleFlowStrategy(window=5, buy_threshold_ratio=0.05, sell_threshold_ratio=0.05)
+        result = strategy.generate_signal("TEST", ohlcv)
+        self.assertEqual(result.signal, Signal.BUY)
+
+    def test_holds_when_confirmed_rows_fall_short_of_window(self):
+        # two trailing rows unconfirmed (e.g. today plus a reporting gap)
+        # leaves only 4 confirmed rows for a 5-day window - not enough,
+        # unlike the single-trailing-NaN case above.
+        ohlcv = _make_ohlcv([100] * 6)
+        ohlcv["institutional_net"] = 50_000
+        ohlcv["foreign_net"] = 50_000
+        ohlcv.loc[ohlcv.index[-2:], "institutional_net"] = np.nan
+        ohlcv.loc[ohlcv.index[-2:], "foreign_net"] = np.nan
         strategy = WhaleFlowStrategy(window=5)
         result = strategy.generate_signal("TEST", ohlcv)
         self.assertEqual(result.signal, Signal.HOLD)
