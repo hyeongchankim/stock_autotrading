@@ -6,3 +6,5 @@ logs/*
 .env
 .kis_cache/
 state.json
+discovery_state.json
+screening_state.json

@@ -2,7 +2,10 @@ seed_capital: 1000000  # 시드 100만원 (KRW)
 
 risk:
   stop_loss_pct: 0.09        # 손절 9% (10%에서 축소 - 백테스트로 검증한 손익비 개선. 8%는 MDD가 악화되어 기각)
-  take_profit_pct: 0.07      # 익절 7% (즉시 청산 - 트레일링 방식은 백테스트 결과 더 나빠서 기각, risk_manager.py 참고)
+  take_profit_pct: 0.18      # 익절 18% (즉시 청산 - 트레일링 방식은 백테스트 결과 더 나빠서 기각, risk_manager.py 참고)
+                              # 7%에서 상향: close_strength 전략 추가 후 손익비 1:2(9%/18%)로 재백테스트한
+                              # 조합이 10종목·6.75년 기준 기존(9%/7%, +47.6%/MDD-23.6%)보다 수익·MDD 둘 다
+                              # 개선됨(+53.8%/MDD-17.5%) - 2026-09-30 세션에서 15개 이상 조합 스윕 후 채택
   position_size_pct: 0.30    # 종목당 비중 30%
   daily_max_loss_pct: 0.30   # 일일 최대 손실한도 30% (시드 대비, 도달 시 당일 신규 진입 중단)
 
@@ -34,6 +37,14 @@ strategies:
       window: 5                   # 최근 5거래일 누적 순매수로 판단
       buy_threshold_ratio: 0.05    # 5거래일 거래대금 대비 외국인+기관 순매수 비율이 +5% 이상이면 매수
       sell_threshold_ratio: 0.05   # 같은 비율이 -5% 이하이면 매도
+    close_strength:
+      enabled: true    # "종가매매" - 당일 종가가 그날 고가/저가 범위의 위쪽(강세 마감)이면서 이동평균선
+                        # 위일 때만 매수 (반대는 매도). RSI/변동성돌파처럼 매일 뒤척이지 않고 확실한 마감
+                        # 강도가 확인될 때만 진입하는, 의도적으로 저빈도인 전략 - whale_flow/rsi/변동성돌파에
+                        # "추가"했을 때(대체 아님) 10종목·6.75년 백테스트에서 기존 3전략 조합보다 수익률과
+                        # MDD 둘 다 개선됨. strategies/close_strength.py 참고
+      ma_period: 20            # 추세 확인용 이동평균 기간
+      close_position_pct: 0.8  # 당일 고저 범위의 상위(하위) 80% 안에서 마감해야 강세(약세)로 판단
   mean_reversion:
     rsi:
       enabled: true
@@ -108,6 +119,23 @@ watchlist:
   - "015760.KS"   # 한국전력 (유틸리티, 장기 박스권/약세 성향)
   - "068270.KS"   # 셀트리온 (바이오)
   - "003550.KS"   # LG (지주사)
+
+discovery:
+  enabled: true     # "발굴형 종가매매" - 위 watchlist 고정 10종목과 별개로, 매일 코스피200+코스닥150을
+                     # 스캔해서 그날그날 후보를 찾아 거래하는 독립 슬리브. 2026-09-30 세션에서 설계·구현.
+  seed_capital: 5000000   # 500만원 - 위 seed_capital/watchlist 슬리브와 완전히 분리된 별도 시드
+                           # (KisBroker의 seed_capital 스코프 로컬 원장 재사용 - broker/kis_broker.py 참고)
+  position_size_pct: 0.20   # 종목당 20% = 최대 5종목 동시 보유 가능 (100%/5)
+  min_price: 5000            # 종가 5,000원 이상만 후보 (호가단위 마찰비용 방지)
+  max_change_pct: 15.0       # 당일 등락률 ±15% 이내만 (상한가 근접 추격매수 방지)
+  min_trading_value: 3000000000   # 거래대금 30억원 이상 (유동성 필터)
+  checkpoints: ["11:00", "13:30", "15:20"]   # 하루 중 스캔 시점 - 15:20이 최종(실제 매매) 체크포인트
+  min_checkpoints: 2         # 이 중 최소 2번 이상 후보로 잡혀야 최종 후보로 인정 (마감 직전 반짝 급등 배제)
+  max_candidates: 5          # 최종 후보 중 등락률 상위 몇 개까지만 매매할지 (position_size_pct와 짝)
+  close_strength_ma_period: 20
+  close_strength_position_pct: 0.8
+  # 청산은 스윙형 - 기존 risk.stop_loss_pct/take_profit_pct/daily_max_loss_pct 그대로 재사용,
+  # 별도 손절/익절 값 없음 (main.py의 run_discovery 참고)
 
 broker:
   provider: kis    # mock | kis

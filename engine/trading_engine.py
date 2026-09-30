@@ -75,6 +75,7 @@ class TradingEngine:
         volume_filter: VolumeFilter | None = None,
         rank_entries_by_momentum: bool = False,
         momentum_window: int = 20,
+        notify: bool = True,
     ):
         if entry_mode not in ("all", "any"):
             raise ValueError("entry_mode must be 'all' or 'any'")
@@ -88,6 +89,10 @@ class TradingEngine:
         self.regime_filter = regime_filter
         self.entry_mode = entry_mode
         self.volume_filter = volume_filter
+        # backtest replays thousands of trades through the same
+        # entry/exit code paper trading uses - without this, each one
+        # would fire a real Telegram send attempt.
+        self.notify = notify
         self.rank_entries_by_momentum = rank_entries_by_momentum
         self.momentum_window = momentum_window
 
@@ -142,6 +147,10 @@ class TradingEngine:
 
         return self.broker.get_total_equity()
 
+    def _notify(self, message: str) -> None:
+        if self.notify:
+            send_notification(message)
+
     def _check_protective_exit(self, symbol: str, current_price: float) -> None:
         position = self.broker.get_positions().get(symbol)
         if position is None:
@@ -160,7 +169,7 @@ class TradingEngine:
                 "%s: %s exit, qty=%s price=%.2f pnl=%.2f",
                 symbol, trigger, result.quantity, result.price, result.realized_pnl,
             )
-            send_notification(
+            self._notify(
                 f"[{env}] {trigger} exit: {symbol} x{result.quantity} @ {result.price:.0f} "
                 f"pnl={result.realized_pnl:+.0f}"
             )
@@ -169,7 +178,7 @@ class TradingEngine:
             # unmanaged until the next cycle re-evaluates it - risk-
             # critical enough to always surface, unlike a failed entry.
             logger.warning("%s: %s exit FAILED - %s", symbol, trigger, result.message)
-            send_notification(f"[{env}] {trigger} exit FAILED: {symbol} - {result.message}")
+            self._notify(f"[{env}] {trigger} exit FAILED: {symbol} - {result.message}")
 
     def _check_strategy_exit(self, symbol: str, ohlcv: pd.DataFrame, current_price: float) -> None:
         position = self.broker.get_positions().get(symbol)
@@ -190,13 +199,13 @@ class TradingEngine:
                 "%s: strategy exit (%s), qty=%s price=%.2f pnl=%.2f",
                 symbol, sell_signals[0].strategy_name, result.quantity, result.price, result.realized_pnl,
             )
-            send_notification(
+            self._notify(
                 f"[{env}] strategy exit ({sell_signals[0].strategy_name}): {symbol} x{result.quantity} "
                 f"@ {result.price:.0f} pnl={result.realized_pnl:+.0f}"
             )
         else:
             logger.warning("%s: strategy exit FAILED - %s", symbol, result.message)
-            send_notification(f"[{env}] strategy exit FAILED: {symbol} - {result.message}")
+            self._notify(f"[{env}] strategy exit FAILED: {symbol} - {result.message}")
 
     def _find_entry_candidate(
         self, symbol: str, ohlcv: pd.DataFrame, current_price: float
@@ -261,7 +270,7 @@ class TradingEngine:
                 "%s: entry (%s), qty=%s price=%.2f",
                 candidate.symbol, candidate.strategy_names, result.quantity, result.price,
             )
-            send_notification(
+            self._notify(
                 f"[{_broker_label(self.broker)}] entry ({candidate.strategy_names}): "
                 f"{candidate.symbol} x{result.quantity} @ {result.price:.0f}"
             )

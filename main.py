@@ -15,6 +15,7 @@ from pathlib import Path
 import yaml
 
 from broker.base import BrokerBase
+from broker.kis_auth import KisSession
 from broker.kis_broker import KisBroker
 from broker.mock_broker import MockBroker
 from data.base import DataFeedBase
@@ -24,6 +25,9 @@ from data.yfinance_feed import YFinanceDataFeed
 from engine.trading_engine import TradingEngine
 from portfolio.buy_and_hold import BuyAndHoldSleeve
 from risk.risk_manager import RiskManager
+from screening.checkpoint_store import persistent_candidates, record_checkpoint
+from screening.discover import filter_candidates, get_universe, scan_market
+from strategies.close_strength import CloseStrengthStrategy
 from strategies.mean_reversion import RSIStrategy, VolatilityBreakoutStrategy
 from strategies.regime import RegimeFilter
 from strategies.trend_following import (
@@ -42,6 +46,8 @@ setup_logging()
 logger = logging.getLogger("main")
 
 STATE_FILE = Path(__file__).parent / "state.json"
+DISCOVERY_STATE_FILE = Path(__file__).parent / "discovery_state.json"
+SCREENING_STATE_FILE = Path(__file__).parent / "screening_state.json"
 
 
 def load_config(path: str) -> dict:
@@ -89,6 +95,13 @@ def build_strategies(config: dict) -> list:
                 window=tf["whale_flow"]["window"],
                 buy_threshold_ratio=tf["whale_flow"]["buy_threshold_ratio"],
                 sell_threshold_ratio=tf["whale_flow"]["sell_threshold_ratio"],
+            )
+        )
+    if tf.get("close_strength", {}).get("enabled"):
+        strategies.append(
+            CloseStrengthStrategy(
+                ma_period=tf["close_strength"]["ma_period"],
+                close_position_pct=tf["close_strength"]["close_position_pct"],
             )
         )
     if mr["rsi"]["enabled"]:
@@ -185,7 +198,8 @@ def build_data_feed(config: dict) -> DataFeedBase:
 
 
 def build_engine(
-    config: dict, broker: BrokerBase, data_feed: DataFeedBase, seed_capital: float | None = None
+    config: dict, broker: BrokerBase, data_feed: DataFeedBase, seed_capital: float | None = None,
+    notify: bool = True,
 ) -> TradingEngine:
     signal_cfg = config.get("signal_combination", {})
     return TradingEngine(
@@ -201,6 +215,7 @@ def build_engine(
         volume_filter=build_volume_filter(config),
         rank_entries_by_momentum=signal_cfg.get("rank_entries_by_momentum", False),
         momentum_window=signal_cfg.get("momentum_window", 20),
+        notify=notify,
     )
 
 
@@ -288,6 +303,114 @@ def run_paper(config: dict) -> None:
         )
 
 
+def run_discovery(config: dict, checkpoint: str) -> None:
+    """'발굴형 종가매매' - screens KOSPI200+KOSDAQ150 for the day's candidates
+    instead of trading the fixed `watchlist`. Runs as its own sleeve with a
+    completely separate seed (config["discovery"]["seed_capital"]) and cash
+    ledger from run_paper's fixed-watchlist sleeve - see config.yaml's
+    `discovery` section and screening/discover.py's module docstring.
+
+    checkpoint: "scan" (11:00/13:30 - screen and record only, no trading) or
+    "final" (15:20 - screen, then trade the candidates that persisted across
+    enough checkpoints). Intended to be invoked by three separate scheduled
+    triggers (see README), not the same 15-min cadence as run_paper.
+    """
+    disc_cfg = config.get("discovery", {})
+    if not disc_cfg.get("enabled", False):
+        return
+    if checkpoint not in ("scan", "final"):
+        raise ValueError("checkpoint must be 'scan' or 'final'")
+
+    kis_cfg = config.get("broker", {}).get("kis", {})
+    env = kis_cfg.get("env", "demo")
+
+    universe = get_universe()
+    session = KisSession(env=env)
+    scan = scan_market(session, min_price=disc_cfg["min_price"], max_change_pct=disc_cfg["max_change_pct"])
+    today_candidates = filter_candidates(scan, universe, min_trading_value=disc_cfg["min_trading_value"])
+    symbols_today = today_candidates["symbol"].tolist()
+
+    screening_store = StateStore(SCREENING_STATE_FILE)
+    record_checkpoint(screening_store, date.today(), symbols_today)
+    logger.info(
+        "discovery %s checkpoint: %d candidates passed 1차 필터 (%s)",
+        checkpoint, len(symbols_today), ", ".join(symbols_today[:10]),
+    )
+
+    if checkpoint != "final":
+        return
+
+    qualified = persistent_candidates(screening_store, date.today(), disc_cfg["min_checkpoints"])
+    ranked = today_candidates[today_candidates["symbol"].isin(qualified)].sort_values(
+        "change_pct", ascending=False
+    )
+    final_candidates = ranked["symbol"].tolist()[: disc_cfg["max_candidates"]]
+    logger.info(
+        "discovery final candidates (%d+ checkpoints required): %s",
+        disc_cfg["min_checkpoints"], final_candidates,
+    )
+
+    broker = KisBroker(
+        env=env, watchlist=list(universe.keys()), seed_capital=disc_cfg["seed_capital"],
+        commission_pct=config.get("costs", {}).get("commission_pct", 0.0),
+        sell_tax_pct=config.get("costs", {}).get("sell_tax_pct", 0.0),
+    )
+    data_feed = KisDataFeed(env=env, session=broker.session)
+    risk_manager = RiskManager(
+        seed_capital=disc_cfg["seed_capital"],
+        stop_loss_pct=config["risk"]["stop_loss_pct"],
+        take_profit_pct=config["risk"]["take_profit_pct"],
+        position_size_pct=disc_cfg["position_size_pct"],
+        daily_max_loss_pct=config["risk"]["daily_max_loss_pct"],
+    )
+
+    store = StateStore(DISCOVERY_STATE_FILE)
+    state = store.load()
+    risk_manager.restore(state.get("risk_manager", {}))
+    broker.restore_ledger(state.get("kis_cash_ledger", {}))
+    risk_manager.roll_to_day(date.today())
+
+    held = set(broker.get_positions().keys())
+    watchlist_today = sorted(held | set(final_candidates))
+
+    engine = TradingEngine(
+        broker=broker,
+        data_feed=data_feed,
+        strategies=[
+            CloseStrengthStrategy(
+                ma_period=disc_cfg["close_strength_ma_period"],
+                close_position_pct=disc_cfg["close_strength_position_pct"],
+            )
+        ],
+        risk_manager=risk_manager,
+        watchlist=watchlist_today,
+        interval=config["data_feed"]["interval"],
+        lookback=config["data_feed"]["lookback_days"],
+        regime_filter=build_regime_filter(config),
+        entry_mode="any",
+        volume_filter=build_volume_filter(config),
+    )
+
+    windows = {}
+    for symbol in watchlist_today:
+        try:
+            windows[symbol] = data_feed.get_ohlcv(symbol, config["data_feed"]["interval"], config["data_feed"]["lookback_days"])
+        except Exception as exc:
+            logger.warning("discovery: skipping %s: failed to fetch data (%s)", symbol, exc)
+
+    equity = engine.run_once(precomputed_windows=windows)
+
+    store.save({
+        "risk_manager": risk_manager.to_dict(),
+        "kis_cash_ledger": broker.ledger_to_dict(),
+    })
+
+    logger.info(
+        "discovery cycle complete. cash=%.0f positions=%s equity=%.0f",
+        broker.get_cash_balance(), list(broker.get_positions().keys()), equity,
+    )
+
+
 def run_backtest(config: dict) -> None:
     from backtest.backtest_runner import BacktestRunner
     from backtest.benchmark import run_buy_and_hold
@@ -314,7 +437,7 @@ def run_backtest(config: dict) -> None:
     data_feed: DataFeedBase = (
         WhaleEnrichedDataFeed(base_feed, KrxInvestorFlowFeed()) if whale_cfg.get("enabled", False) else base_feed
     )
-    engine = build_engine(config, broker, data_feed, seed_capital=strategy_seed)
+    engine = build_engine(config, broker, data_feed, seed_capital=strategy_seed, notify=False)
 
     history_days = config.get("backtest", {}).get("history_days", 500)
     symbol_data = {}
@@ -388,8 +511,12 @@ def run_backtest(config: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Stock auto-trading skeleton")
-    parser.add_argument("--mode", choices=["paper", "backtest"], default="paper")
+    parser.add_argument("--mode", choices=["paper", "backtest", "discovery"], default="paper")
     parser.add_argument("--config", default=str(Path(__file__).parent / "config.yaml"))
+    parser.add_argument(
+        "--checkpoint", choices=["scan", "final"], default="scan",
+        help="discovery mode only: 'scan' (11:00/13:30, screen only) or 'final' (15:20, screen+trade)",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -402,6 +529,12 @@ def main() -> None:
             run_paper(config)
         except Exception as exc:
             send_notification(f"[stock_autotrading] paper cycle CRASHED: {exc}")
+            raise
+    elif args.mode == "discovery":
+        try:
+            run_discovery(config, args.checkpoint)
+        except Exception as exc:
+            send_notification(f"[stock_autotrading] discovery {args.checkpoint} CRASHED: {exc}")
             raise
     else:
         run_backtest(config)

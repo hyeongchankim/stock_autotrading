@@ -144,6 +144,20 @@ class TestEngineEntryExitNotifications(unittest.TestCase):
         messages = [c.args[0] for c in mock_notify.call_args_list]
         self.assertTrue(any("FAILED" in m and "A" in m for m in messages))
 
+    @patch("engine.trading_engine.send_notification")
+    def test_notify_false_suppresses_entry_notification(self, mock_notify):
+        # backtest replays entries/exits through this same code path -
+        # notify=False (set by run_backtest) must not fire real sends.
+        broker = MockBroker(seed_capital=100_000)
+        risk_manager = RiskManager(seed_capital=100_000, position_size_pct=0.5)
+        engine = TradingEngine(
+            broker=broker, data_feed=None, strategies=[_AlwaysBuyStrategy()],
+            risk_manager=risk_manager, watchlist=["A"], notify=False,
+        )
+        engine.run_once(precomputed_windows={"A": _make_ohlcv()})
+
+        mock_notify.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
