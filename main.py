@@ -47,6 +47,7 @@ logger = logging.getLogger("main")
 
 STATE_FILE = Path(__file__).parent / "state.json"
 DISCOVERY_STATE_FILE = Path(__file__).parent / "discovery_state.json"
+MACD_STATE_FILE = Path(__file__).parent / "macd_state.json"
 SCREENING_STATE_FILE = Path(__file__).parent / "screening_state.json"
 
 
@@ -303,6 +304,75 @@ def run_paper(config: dict) -> None:
         )
 
 
+def run_macd_sleeve(config: dict) -> None:
+    """MACD golden/dead-cross, alone (no regime_filter/volume_filter), on
+    the same fixed `watchlist` as run_paper - but a completely separate
+    sleeve with its own seed_capital (config["macd_sleeve"]) and cash
+    ledger (`macd_state.json`), never mixed with run_paper's or
+    run_discovery's state. See config.yaml's `macd_sleeve` section for why
+    the filters are deliberately left off (they cut MACD's backtested
+    return roughly in half-to-worse - a 2026-10-01 session finding) and
+    the volatility tradeoff that comes with that choice.
+    """
+    sleeve_cfg = config.get("macd_sleeve", {})
+    if not sleeve_cfg.get("enabled", False):
+        return
+
+    seed = sleeve_cfg["seed_capital"]
+    broker = build_broker(config, seed_capital=seed)
+    data_feed = build_data_feed(config)
+    risk_manager = build_risk_manager(config, seed_capital=seed)
+    risk_manager.position_size_pct = sleeve_cfg["position_size_pct"]
+
+    engine = TradingEngine(
+        broker=broker,
+        data_feed=data_feed,
+        strategies=[MACDStrategy()],
+        risk_manager=risk_manager,
+        watchlist=config["watchlist"],
+        interval=config["data_feed"]["interval"],
+        lookback=config["data_feed"]["lookback_days"],
+        regime_filter=None,
+        entry_mode="any",
+        volume_filter=None,
+    )
+
+    store = StateStore(MACD_STATE_FILE)
+    state = store.load()
+    engine.risk_manager.restore(state.get("risk_manager", {}))
+    if isinstance(broker, KisBroker):
+        broker.restore_ledger(state.get("kis_cash_ledger", {}))
+    engine.risk_manager.roll_to_day(date.today())
+    was_halted_today = engine.risk_manager.trading_halted_today
+
+    windows = {}
+    for symbol in config["watchlist"]:
+        try:
+            windows[symbol] = data_feed.get_ohlcv(
+                symbol, config["data_feed"]["interval"], config["data_feed"]["lookback_days"]
+            )
+        except Exception as exc:
+            logger.warning("macd_sleeve: skipping %s: failed to fetch data (%s)", symbol, exc)
+
+    equity = engine.run_once(precomputed_windows=windows)
+
+    store.save({
+        "risk_manager": engine.risk_manager.to_dict(),
+        "kis_cash_ledger": broker.ledger_to_dict() if isinstance(broker, KisBroker) else {},
+    })
+
+    if not was_halted_today and engine.risk_manager.trading_halted_today:
+        send_notification(
+            f"[stock_autotrading][macd_sleeve] daily_max_loss_pct 도달 - 오늘 신규 진입 중단됨 "
+            f"(realized_pnl={engine.risk_manager.daily_realized_pnl:.0f})"
+        )
+
+    logger.info(
+        "macd_sleeve cycle complete. cash=%.0f positions=%s equity=%.0f",
+        broker.get_cash_balance(), list(broker.get_positions().keys()), equity,
+    )
+
+
 def run_discovery(config: dict, checkpoint: str) -> None:
     """'발굴형 종가매매' - screens KOSPI200+KOSDAQ150 for the day's candidates
     instead of trading the fixed `watchlist`. Runs as its own sleeve with a
@@ -511,7 +581,7 @@ def run_backtest(config: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Stock auto-trading skeleton")
-    parser.add_argument("--mode", choices=["paper", "backtest", "discovery"], default="paper")
+    parser.add_argument("--mode", choices=["paper", "backtest", "discovery", "macd"], default="paper")
     parser.add_argument("--config", default=str(Path(__file__).parent / "config.yaml"))
     parser.add_argument(
         "--checkpoint", choices=["scan", "final"], default="scan",
@@ -535,6 +605,12 @@ def main() -> None:
             run_discovery(config, args.checkpoint)
         except Exception as exc:
             send_notification(f"[stock_autotrading] discovery {args.checkpoint} CRASHED: {exc}")
+            raise
+    elif args.mode == "macd":
+        try:
+            run_macd_sleeve(config)
+        except Exception as exc:
+            send_notification(f"[stock_autotrading] macd_sleeve cycle CRASHED: {exc}")
             raise
     else:
         run_backtest(config)

@@ -137,6 +137,18 @@ discovery:
   # 청산은 스윙형 - 기존 risk.stop_loss_pct/take_profit_pct/daily_max_loss_pct 그대로 재사용,
   # 별도 손절/익절 값 없음 (main.py의 run_discovery 참고)
 
+macd_sleeve:
+  enabled: true   # MACD 골든/데드크로스 단독, 위 watchlist 고정 10종목에 그대로 적용하되 완전히
+                   # 별도 시드로 운용하는 세 번째 슬리브. regime_filter/volume_filter 둘 다 의도적으로
+                   # 미적용 - 10종목·6.75년 백테스트에서 필터 없음이 +176.1%/MDD-25.3%로 가장 수익이
+                   # 높았고(필터를 걸수록 수익이 깎임, 특히 volume_filter는 역효과), 사용자가 "최대 수익"
+                   # 쪽을 선택함(2026-10-01 세션) - 그만큼 변동성도 큼(월 최저 -21.3%, 2024년은 -13.9%
+                   # 손실 해였음), 고정 워치리스트/발굴형 슬리브보다 훨씬 공격적인 성격이라는 점 유의.
+  seed_capital: 5000000   # 500만원 - 다른 슬리브들과 완전히 분리된 별도 시드/현금원장
+  position_size_pct: 0.30   # 기존 고정워치리스트 슬리브와 동일 (최대 ~3종목 동시 보유)
+  # 청산은 기존 risk.stop_loss_pct/take_profit_pct/daily_max_loss_pct 그대로 재사용 (main.py의
+  # run_macd_sleeve 참고). regime_filter/volume_filter는 위 이유로 의도적으로 미적용.
+
 broker:
   provider: kis    # mock | kis
                     # "kis"는 실제 한국투자증권 계좌로 paper 모드에서만 적용됨.
