@@ -285,8 +285,9 @@
       그대로(첫 실행 때 `positions: {}`로 저장됨)
     - **교훈**: "별도 시드"를 현금만 나눠서 구현하면 공유 계좌에선 포지션이 안 나뉜다 - 슬리브를
       더 추가할 때(또는 발굴형/MACD가 같은 종목을 노릴 때)마다 이 격리가 깨지지 않는지 확인할 것.
-      유닛테스트가 실제 `logs/trading.log`에 기록을 남기는 것도 확인됨(13:21의 `A: entry
-      (always_buy)` 등) - 로그 읽을 때 테스트 흔적과 구분
+      유닛테스트가 실제 `logs/trading.log`에 기록을 남기던 것도 확인됨(13:21의 `A: entry
+      (always_buy)` 등) - 원인은 `main.py`의 임포트 시점 `setup_logging()`, `e60ab3b`에서 수정됨.
+      과거 흔적은 로그에 남아있으니 로그 읽을 때 구분
     - **알려진 한계**: 지정가 BUY가 `_actual_bought_qty` 타임아웃(0체결 간주) 뒤에 늦게 체결되면 그
       주식은 어느 슬리브 장부에도 없는 "고아"가 됨(예전엔 계좌에서 바로 보였음). 발견 시 수동으로
       해당 슬리브 `positions`에 넣을 것
@@ -305,11 +306,14 @@
       재발급. 그래도 실패하거나 다른 403이면 기존처럼 즉시 예외. 테스트 4개 추가(실제
       `.kis_cache`는 건드리지 않게 `_load_cached_token`/`_save_token_cache` 패치) → 전체 141개 통과
     - **검증 한계**: 유닛테스트로만 확인됨 - 실제 충돌은 다음 토큰 만료 시점에나 재현됨.
-      **⚠️ 로그의 `KIS token issuance rate-limited, waiting 61s ...` 경고만으론 증거가 안 됨** -
-      유닛테스트(`TestKisTokenRateLimit`)가 운영 `logs/trading.log`에 같은 경고를 그대로 남김
-      (2026-10-01 15:03:18에 실제로 3줄 찍혔고, 같은 초에 테스트의 `A: entry (always_buy)` 로그가
-      있었음). 진짜 충돌이면 스케줄러 시작 시각(HH:00/15/30/45) 부근에 찍히고 테스트 로그가 같은
-      초에 없다 - 반드시 시각·주변 로그로 구분할 것
+      **⚠️ 2026-10-01(commit `e60ab3b`) 이전 로그의 `KIS token issuance rate-limited, waiting
+      61s ...` 경고는 증거가 안 됨** - 그때까지는 `main.py`가 임포트 시점에 `setup_logging()`을
+      호출해서 유닛테스트(`TestKisTokenRateLimit` 등)가 운영 `logs/trading.log`에 같은 경고를
+      그대로 남겼음(15:03:18에 실제로 3줄 찍혔고 같은 초에 테스트의 `A: entry (always_buy)`
+      로그가 있었음). `e60ab3b`에서 `setup_logging()`을 `main()` 안으로 옮겨 **이후로는 테스트가
+      운영 로그를 안 건드림**(테스트 전후 흔적 줄 수 동일 확인) - 그 이후의 경고는 실제 충돌이
+      맞음(스케줄러 시작 시각 HH:00/15/30/45 부근). 과거 흔적(11:27, 13:21, 13:55, 15:03)은 로그에
+      그대로 남아있으니 시각으로 구분
     - **15:00 사이클 참고**: MACD는 KIS 모의서버 `inquire-balance` read timeout 3회 소진으로
       크래시(종료코드 1) - 오늘 반복된 서버 불안정 패턴이고 격리/토큰 수정과 무관, 상태 파일은
       그대로 유지됨(다음 사이클에서 재시도)
@@ -385,7 +389,8 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 ## Git 상태
 
 - 코드 변경은 전부 커밋·푸시 완료. MACD 슬리브는 `7fbdfd4`, 포지션 격리 수정은 `1682a8a`,
-  토큰 발급 충돌 수정은 `45a96fc` (테스트 141개 통과). 로컬에만 있는 untracked 파일: `state.json.bak-20261001`,
+  토큰 발급 충돌 수정은 `45a96fc`, 테스트가 운영 로그에 쓰던 문제 수정은 `e60ab3b`
+  (테스트 141개 통과). 로컬에만 있는 untracked 파일: `state.json.bak-20261001`,
   `macd_state.json.bak-20261001`(23번의 보정 전 백업).
   - `state.json`/`discovery_state.json`/`screening_state.json`/`macd_state.json`과 스케줄러
     등록(`StockAutoTradingPaper`, `StockDiscoveryScan1/2`, `StockDiscoveryFinal`,
@@ -401,7 +406,7 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 1. **격리·토큰 수정 관찰** (최우선) - Paper/Macd는 같은 시각에 돎. `state.json`/`macd_state.json`의
    `positions`와 현금이 서로 안 섞이는지, 워치리스트 로그에 "refusing to sell another sleeve's
    shares"가 뜨는 경우(= 격리가 실제로 막은 사례), 로그에 "token issuance rate-limited"가 뜨는
-   경우(= 토큰 충돌 수정이 실제로 작동한 사례 - 단 유닛테스트도 같은 로그를 남기니 시각으로 구분,
+   경우(= 토큰 충돌 수정이 실제로 작동한 사례 - 단 `e60ab3b` 이전 로그는 테스트 흔적일 수 있음,
    24번 참고) 확인. 15:15 이후 사이클은 아직 결과 미확인
 2. **MACD 슬리브 관찰** - 변동성이 큰 공격적 전략이라(월최저 -21.3%, 손실 해 있었음) 처음 며칠은
    특히 지켜볼 것 (로그: `logs/macd_stdout_YYYY-MM-DD.log`, 상태: `macd_state.json`). 서킷브레이커
