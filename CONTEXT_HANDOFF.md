@@ -15,16 +15,19 @@
 - 이 PC 특이사항: Windows 계정명에 한글(김형찬)이 포함되어 있어서 yfinance/pykrx/requests가
   SSL 인증서 경로를 못 찾는 문제가 있음 → `SSL_CERT_FILE`/`CURL_CA_BUNDLE` 환경변수를
   `C:\ca-certs\cacert.pem`으로 지정해야 정상 동작 (README "트러블슈팅" 섹션 참고).
-- **장중 자동 실행 중 (스케줄러 2세트, 완전 독립)**:
-  - `StockAutoTradingPaper`: 고정 10종목 워치리스트, 평일 09:00~15:30 15분 간격,
-    `run_paper_cycle.bat` → `python main.py --mode paper` (시드는 `config.yaml`의
-    `seed_capital`, `state.json`)
+- **장중 자동 실행 중 (스케줄러 3세트, 완전 독립 - 슬리브마다 별도 시드/상태파일)**:
+  - `StockAutoTradingPaper`: 고정 10종목 워치리스트(whale_flow+rsi+변동성돌파+close_strength),
+    평일 09:00~15:30 15분 간격, `run_paper_cycle.bat` → `python main.py --mode paper`
+    (시드는 `config.yaml`의 `seed_capital` 100만원, `state.json`)
   - `StockDiscoveryScan1`(11:00)/`StockDiscoveryScan2`(13:30)/`StockDiscoveryFinal`(15:20):
     코스피200+코스닥150 매일 스캔형("발굴형 종가매매"), `run_discovery_cycle.bat scan|final` →
     `python main.py --mode discovery --checkpoint scan|final` (별도 시드 500만원,
     `discovery_state.json`/`screening_state.json`)
+  - `StockAutoTradingMacd`: 같은 고정 10종목 워치리스트에 **MACD 단독**(필터 없음) 적용,
+    평일 09:00~15:30 15분 간격, `run_macd_cycle.bat` → `python main.py --mode macd`
+    (별도 시드 500만원, `macd_state.json`) - 아래 "핵심 여정" 22번 참고
   - 전부 git엔 등록 안 됨, 로컬 머신 상태 - 재현 커맨드는 아래 "핵심 여정" 8번(고정워치리스트),
-    19번(발굴형) 참고.
+    19번(발굴형), 22번(MACD) 참고.
 
 ## 지금까지 채택된 최종 설정 (config.yaml)
 
@@ -40,6 +43,7 @@
 | 그 외 trend_following (ma_cross/bollinger/donchian/macd) | 전부 비활성 | whale_flow/close_strength로 대체됨 |
 | `strategies.mean_reversion.rsi`, `volatility_breakout` | 활성 | 유지 |
 | `discovery.*` | **신규 슬리브, 별도 시드 500만원** | 코스피200+코스닥150 매일 스캔형 종가매매 - 아래 "핵심 여정" 19번 참고 |
+| `macd_sleeve.*` | **신규 슬리브, 별도 시드 500만원** | MACD 단독, regime/volume 필터 의도적 미적용(필터 걸면 수익 반토막 이하) - 아래 "핵심 여정" 21~22번 참고. **주의**: `strategies.trend_following.macd.enabled`(아래 행)와는 무관 - `run_macd_sleeve()`가 config 안 거치고 `MACDStrategy()`를 직접 생성함 |
 | `regime_filter` | 활성 (ADX 14, 25/20) | 추세/횡보 국면별로 맞는 전략만 진입 허용 |
 | `volume_filter` | 활성 (20일 평균 대비 1.5배) | 순수 개선 확인됨 |
 | `hybrid.enabled` | true, `strategy_allocation_pct: 0.5` | 시드를 전략 50%+Buy&Hold 50%로 분리, MDD 최저점 |
@@ -215,6 +219,41 @@
     - **아직 검증 안 된 것**: 실제 신규 진입이 자연스럽게 나오는 걸 아직 못 봄(스캔/후보선정까지만
       확인, 오늘 최종후보 5종목엔 매수신호가 안 나서 거래 없이 끝남) - 내일(10/1)부터 스케줄러가
       돌면서 자연스럽게 확인될 것
+20. **스케줄러 재확인 + 09-30 로그 점검**: 10/1 세션 시작하며 4개 스케줄(당시 3개) 상태 확인 -
+    전부 정상 등록. 09-30 로그를 보니 **07-17급으로 안 좋은 날**이었음(14회 성공/53건 크래시,
+    전부 `inquire-balance` read timeout/SSL EOF - 기존에 문서화된 "KIS 모의서버 불안정" 패턴
+    그대로, 새 버그 아님). 포지션/현금은 하루 종일 그대로라 상태 오염 없음 - 설계대로 재시도→
+    다음 사이클 복구가 또 한 번 실증됨. (이날 Claude가 발굴형 기능 개발하며 같은 계좌에 수동
+    테스트 스크립트를 많이 돌렸던 것도 서버 부하에 일부 기여했을 가능성 있음, 확실친 않음)
+21. **Finviz/TradingView 5대 스크리닝 패턴 조사·구현·백테스트**: 사용자가 공유한 표(Golden Cross,
+    MACD Bullish Crossover, RSI Oversold+Uptrend, 52-Week High Breakout, Stacked MA/정배열)를
+    검증. Golden Cross/MACD는 기존 `MovingAverageCrossStrategy`/`MACDStrategy`(둘 다
+    `strategies/trend_following.py`, config에서는 비활성) 재사용, 나머지 3개는 신규 구현
+    (`strategies/screening_patterns.py`: `RSIUptrendStrategy`, `FiftyTwoWeekHighBreakoutStrategy`,
+    `StackedMAStrategy`). 10종목·6.75년 개별 백테스트(필터 없음) 결과:
+    Golden Cross +4.3%, **MACD +175.5%**, RSI+추세 +9.4%, 52주신고가 +96.6%, 정배열 +74.2%
+    (전부 MDD -11~-27% 사이). **5개를 그냥 다 합치면 오히려 역효과** - 필터 없이 합쳐도 +20.0%로
+    개별 최고에 한참 못 미치고(전략끼리 SELL 신호로 서로 포지션 조기청산시킴), regime/volume
+    필터까지 적용하면 -6.4%로 마이너스. **MACD 단독으로 필터 영향 분리 실험**: 필터 없음 +176.1%
+    → regime_filter만 +55.5%(MDD -18.9%로 개선, 승률도 상승 - 합리적 트레이드오프) →
+    volume_filter만 +26.3% → 둘 다 -12.8%. **volume_filter가 범인**: MACD 크로스는 거래량 폭증
+    시점이 아니라 "추세 전환 초입"에 나와서, "20일 평균 대비 1.5배 거래량" 조건과 구조적으로
+    안 맞음. MACD 단독(필터없음)의 월별/연도별 분포도 확인 - 82개월 월평균 +1.41%(표준편차
+    6.31%, 최고월 +20.5%/최저월 -21.3%), 8년 중 7년 플러스(2024년만 -13.9% 손실 해) - 특정
+    구간에 몰린 요행이 아니라 여러 해에 걸쳐 반복된 실제 성과로 확인됨. 다만 거래 883건/승률
+    35%로 변동성이 매우 큰 공격적 성격 - "손절 자주 없이 안전하게"와는 정반대 프로필.
+22. **MACD 전용 네 번째 슬리브 신설**: 위 분석 결과를 사용자에게 제시(필터조합/시드/비중 3가지
+    선택지) → **필터 없음(최대수익 +176.1%/MDD-25.3%) + 별도 시드 500만원 + 비중 30%**로 확정.
+    `config.yaml`에 `macd_sleeve` 섹션 추가, `main.py`의 `run_macd_sleeve()` - 기존 `watchlist`
+    10종목에 MACD 전략만 단독 적용(regime_filter/volume_filter 둘 다 의도적 미적용), 완전히
+    분리된 시드/현금원장(`macd_state.json`), `--mode macd`. 신규 스케줄러 `StockAutoTradingMacd`
+    (평일 09:00~15:30 15분 간격, `StockAutoTradingPaper`와 동일 주기). **실제 KIS 데이터로 첫
+    사이클부터 바로 진입 체결 확인**(셀트리온 068270.KS 8주 @183,000원) - 다른 슬리브들보다
+    MACD가 훨씬 자주 신호를 내는 걸 실증. 테스트 12개 추가(`tests/test_screening_patterns.py`).
+    - **⚠️ 아직 커밋 안 됨** - 코드는 전부 동작 확인됐지만 git에는 반영 안 된 상태로 세션 종료.
+      다음 세션에서 가장 먼저 할 일: 변경사항 리뷰 후 커밋/푸시 (`.gitignore`, `config.yaml`,
+      `main.py`, 신규 `run_macd_cycle.bat`, `strategies/screening_patterns.py`,
+      `tests/test_screening_patterns.py`)
 
 ## 참고 자료 (발굴형 종가매매 설계 시 조사한 GitHub 프로젝트)
 
@@ -260,13 +299,18 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 - BUY 주문의 실제 체결 여부 확인 (미체결을 체결로 착각하던 버그 수정, 위 "핵심 여정" 12번)
 - whale_flow가 장중에도 정상적으로 실제 BUY/SELL 신호를 낼 수 있음을 실데이터로 확인 (위
   "핵심 여정" 12번 - 수정 전엔 항상 HOLD였음)
+- **MACD 슬리브의 자연 진입 체결 확인** (2026-10-01, 첫 사이클만에 셀트리온 8주 체결) - 네
+  슬리브 중 가장 빠르게, 가장 명확하게 "자연 신호→실주문"이 실증된 사례
 
 ❌ 아직 안 됨:
-- **엔진의 자연 신호를 통한 실주문 "진입" 체결 미확인** - 청산은 2026-09-29에 실증됐지만(위
-  참고), 진입은 여전히 강제 테스트(`scripts/force_entry_test.py`)로만 확인됨. 계속 관찰,
+- **고정 워치리스트/발굴형 슬리브의 자연 신호 "진입" 체결 미확인** - 청산은 2026-09-29에
+  실증됐지만(위 참고), 진입은 여전히 강제 테스트(`scripts/force_entry_test.py`)로만 확인됨
+  (고정 워치리스트 기준). MACD 슬리브는 이미 실증됨(바로 위 참고) - 나머지도 계속 관찰,
   능동적으로 더 할 일 없음.
 - **발굴형 종가매매의 자연 매매도 미확인** - 파이프라인(스캔→후보선정)은 실증됐지만 실제 매수
   신호가 나서 진입하는 것까진 아직 못 봄. 10/1부터 스케줄러(3개)가 돌면서 확인될 것
+- **MACD 슬리브 코드 전체가 아직 git에 커밋 안 됨** - 로컬에서는 동작 확인됐지만 push는커녕
+  commit도 안 된 상태 (위 "핵심 여정" 22번 참고) - 다음 세션 최우선 작업
 - `broker.provider: kis`가 지금 config.yaml에 켜진 상태 - 안 쓸 때는 `mock`으로 되돌리는 게 안전
 - 부분체결/체결확인(`get_daily_fills()`)은 엔진 로직에 연결 안 함 - 포지션 디프 방식으로 더
   가볍게 실제 위험(realized_pnl 정확도)을 해결해서 필요성이 낮아짐, 의도적 보류
@@ -279,11 +323,18 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 
 ## Git 상태
 
-- 전부 커밋/푸시됨, 최신 커밋 `f45a2f7` (close_strength 전략 + 발굴형 종가매매 신규 슬리브, 위
-  "핵심 여정" 18~19번). `git log --oneline -1`로 재확인 가능. `state.json`/`discovery_state.json`/
-  `screening_state.json`과 스케줄러 등록(`StockAutoTradingPaper`, `StockDiscoveryScan1/2`,
-  `StockDiscoveryFinal`)은 전부 로컬 머신 상태라 git에는 없음 (재현 커맨드는 위 "핵심 여정" 8번,
-  19번 참고).
+- **⚠️ 커밋 안 된 변경사항 있음** (2026-10-01 세션 종료 시점) - 최신 커밋은 `5024a34`
+  (CONTEXT_HANDOFF.md 갱신)이지만, 그 이후 MACD 슬리브 작업(위 "핵심 여정" 21~22번)이
+  커밋/푸시 안 된 채 남아있음:
+  - 수정: `.gitignore`(`macd_state.json` 추가), `config.yaml`(`macd_sleeve` 섹션),
+    `main.py`(`run_macd_sleeve()`, `--mode macd`)
+  - 신규: `run_macd_cycle.bat`, `strategies/screening_patterns.py`, `tests/test_screening_patterns.py`
+  - `git status --short`로 확인 후 커밋할 것 - 테스트(133개)는 이미 통과 확인됨, 실제 KIS로
+    `--mode macd` 실행도 검증됨(셀트리온 체결) - 안전하게 커밋 가능한 상태
+  - `state.json`/`discovery_state.json`/`screening_state.json`/`macd_state.json`과 스케줄러
+    등록(`StockAutoTradingPaper`, `StockDiscoveryScan1/2`, `StockDiscoveryFinal`,
+    `StockAutoTradingMacd`)은 전부 로컬 머신 상태라 git에는 없음 (재현 커맨드는 위 "핵심 여정"
+    8번, 19번, 22번 참고).
 - 커밋 전 항상 확인: 앱키/시크릿/계좌번호가 코드에 하드코딩 안 됐는지 (지금까지는 전부
   환경변수로만 관리됨, 문제 없음). `state.json`은 gitignore 되어 있어 커밋 대상 아님.
 - **작업 순서 규칙**: 사용자가 명시적으로 요청함 - CONTEXT_HANDOFF.md 갱신은 항상 코드 변경을
@@ -291,19 +342,22 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 
 ## 다음에 이어서 할 만한 것
 
-1. **발굴형 종가매매 스케줄러(10/1부터 가동) 관찰** - 3개 스케줄(11:00/13:30/15:20)이 정상
-   작동하는지, 자연스럽게 매수까지 이어지는지 며칠 지켜볼 것 (로그: `logs/discovery_stdout_
-   YYYY-MM-DD.log`, 상태: `discovery_state.json`/`screening_state.json`) - 능동적으로 더 할
-   건 없고 시간이 필요한 항목
-2. 기존 워치리스트 슬리브도 자연 "진입" 신호가 나오는지 계속 관찰 (로그: `logs/trading.log`,
+1. **MACD 슬리브 코드 커밋/푸시** (최우선, 위 "Git 상태" 참고) - 리뷰 후 바로 진행 가능한 상태
+2. **MACD 슬리브 관찰** - 변동성이 큰 공격적 전략이라(월최저 -21.3%, 손실 해 있었음) 처음 며칠은
+   특히 지켜볼 것 (로그: `logs/macd_stdout_YYYY-MM-DD.log`, 상태: `macd_state.json`). 서킷브레이커
+   (`daily_max_loss_pct` 30%)는 이 슬리브에도 동일하게 적용되니 큰 하루손실은 자동으로 막힘
+3. **발굴형 종가매매 스케줄러 관찰 계속** - 3개 스케줄(11:00/13:30/15:20)이 자연스럽게 매수까지
+   이어지는지 (로그: `logs/discovery_stdout_YYYY-MM-DD.log`) - 능동적으로 더 할 건 없고 시간
+   필요
+4. 기존 워치리스트 슬리브도 자연 "진입" 신호가 나오는지 계속 관찰 (로그: `logs/trading.log`,
    `logs/scheduler_stdout_YYYY-MM-DD.log`)
-3. 발굴형 슬리브의 시장스캔 페이지네이션 미구현 상태 - 필요하면 KIS API의 `tr_cont="M"` 연속조회
+5. 발굴형 슬리브의 시장스캔 페이지네이션 미구현 상태 - 필요하면 KIS API의 `tr_cont="M"` 연속조회
    로직 추가 (지금은 첫 페이지 ~30건만 봄)
-4. (선택) `costs.slippage_pct`를 실제 값으로 켜고 재백테스트해서 손절/비중/하이브리드 비율
+6. (선택) `costs.slippage_pct`를 실제 값으로 켜고 재백테스트해서 손절/비중/하이브리드 비율
    결론이 슬리피지 하에서도 여전히 유효한지 확인
-5. (선택) 1% 리스크기반 사이징(핵심 여정 17번, 실험만 하고 미반영)을 프로덕션에 적용할지 결정
-6. 정말 실전(`broker.kis.env: real`) 전환을 고려한다면, README "실전 전환 가이드"를 따라
+7. (선택) 1% 리스크기반 사이징(핵심 여정 17번, 실험만 하고 미반영)을 프로덕션에 적용할지 결정
+8. 정말 실전(`broker.kis.env: real`) 전환을 고려한다면, README "실전 전환 가이드"를 따라
    사용자 본인이 직접 진행 (Claude는 전환/실주문을 대신 실행하지 않음 - 명시적으로 합의된 경계).
-   단, 발굴형 슬리브는 별도 시드(500만원)이므로 전환 가이드의 "state.json 정리" 단계에
-   `discovery_state.json`/`screening_state.json`도 포함해야 함 (README 아직 미반영 - 실전
-   전환 논의 시 업데이트 필요)
+   단, 발굴형/MACD 슬리브는 전부 별도 시드이므로 전환 가이드의 "state.json 정리" 단계에
+   `discovery_state.json`/`screening_state.json`/`macd_state.json`도 포함해야 함 (README 아직
+   미반영 - 실전 전환 논의 시 업데이트 필요)
