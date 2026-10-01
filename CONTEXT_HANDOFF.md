@@ -16,8 +16,9 @@
   SSL 인증서 경로를 못 찾는 문제가 있음 → `SSL_CERT_FILE`/`CURL_CA_BUNDLE` 환경변수를
   `C:\ca-certs\cacert.pem`으로 지정해야 정상 동작 (README "트러블슈팅" 섹션 참고).
 - **장중 자동 실행 (스케줄러 3세트, 슬리브마다 별도 시드/상태파일/포지션장부)**.
-  **⚠️ 2026-10-01 13:50부터 `StockAutoTradingPaper`/`StockAutoTradingMacd`는 Disabled** -
-  슬리브 간 포지션 오염 수정(아래 "핵심 여정" 23번) 후 재활성화 대기 중. 발굴형 3개는 Ready:
+  (`StockAutoTradingPaper`/`StockAutoTradingMacd`는 2026-10-01 13:50~14:20 슬리브 간 포지션
+  오염 수정(아래 "핵심 여정" 23번) 동안 Disabled였다가 수동 검증 후 14:20에 재활성화됨 - 현재 5개
+  전부 Ready):
   - `StockAutoTradingPaper`: 고정 10종목 워치리스트(whale_flow+rsi+변동성돌파+close_strength),
     평일 09:00~15:30 15분 간격, `run_paper_cycle.bat` → `python main.py --mode paper`
     (시드는 `config.yaml`의 `seed_capital` 100만원, `state.json`)
@@ -264,7 +265,8 @@
     - **발견 경위**: `^C` 종료 확인용으로 13:45 사이클 결과를 보다가 수치(MACD 에쿼티 감소, 워치리스트
       에쿼티 증가)가 이상해서 추적. 13:30 `^C`(종료코드 `3221225786`) 자체는 일회성으로 보임
       (13:45 사이클은 둘 다 `0`으로 정상 종료, 원인은 확정 못 함)
-    - **조치 1 - 스케줄러 중지**: Paper/Macd를 Disabled (오염이 더 쌓이지 않게)
+    - **조치 1 - 스케줄러 중지**: Paper/Macd를 Disabled (오염이 더 쌓이지 않게) - 수정·보정·
+      수동 검증 후 14:20에 재활성화
     - **조치 2 - 코드 수정 (commit `1682a8a`)**: `broker/kis_broker.py` - 시드가 있는 슬리브는
       자기가 체결한 `symbol → {quantity, avg_price}` 장부(`_owned`)를 갖고 `ledger_to_dict()`/
       `restore_ledger()`로 `kis_cash_ledger.positions`에 영속화. `get_positions()`는 이 장부 몫만
@@ -337,9 +339,10 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
   슬리브 중 가장 빠르게, 가장 명확하게 "자연 신호→실주문"이 실증된 사례
 
 ❌ 아직 안 됨:
-- **슬리브별 포지션 격리(23번)는 유닛테스트로만 검증** - 실제 KIS 사이클로는 아직 확인 안 됨.
-  Paper/Macd 스케줄러는 Disabled 상태 - 재활성화 전 `python main.py --mode macd` 1회 수동 실행으로
-  `macd_state.json`의 `positions`가 올바르게 이어지는지 확인할 것(모의계좌에 주문이 나갈 수 있음)
+- **슬리브별 포지션 격리(23번)는 "SELL 거절" 경로만 유닛테스트로 검증** - 14:06 `--mode macd`와
+  14:17 `--mode paper` 수동 실행에서 MACD가 셀트리온 5주를 장부로 이어받고 워치리스트 슬리브엔
+  안 보이는 것(주문 없음, 상태파일 유지)까지는 실계좌 데이터로 확인됨. 하지만 워치리스트 쪽에
+  셀트리온 SELL 신호가 실제로 나서 거절되는 순간은 아직 못 봄(그 사이클에선 신호 없음)
 - **고정 워치리스트/발굴형 슬리브의 자연 신호 "진입" 체결 미확인** - 청산은 2026-09-29에
   실증됐지만(위 참고), 진입은 여전히 강제 테스트(`scripts/force_entry_test.py`)로만 확인됨
   (고정 워치리스트 기준). MACD 슬리브는 이미 실증됨(바로 위 참고) - 나머지도 계속 관찰,
@@ -372,9 +375,9 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 
 ## 다음에 이어서 할 만한 것
 
-1. **Paper/Macd 스케줄러 재활성화** (최우선) - 먼저 `python main.py --mode macd` 수동 1회로
-   포지션 격리가 실사이클에서 동작하는지 확인(셀트리온 5주가 MACD 장부에서 이어지는지, 워치리스트
-   슬리브가 그걸 못 건드리는지) 후 `Enable-ScheduledTask`로 두 개 재활성화. 사용자 판단 사항
+1. **재활성화 후 첫 사이클들 관찰** (최우선) - 14:30부터 Paper/Macd가 다시 같은 시각에 돎.
+   `state.json`/`macd_state.json`의 `positions`와 현금이 서로 안 섞이는지, 워치리스트 로그에
+   "refusing to sell another sleeve's shares"가 뜨는 경우(= 격리가 실제로 막은 사례) 확인
 2. **MACD 슬리브 관찰** - 변동성이 큰 공격적 전략이라(월최저 -21.3%, 손실 해 있었음) 처음 며칠은
    특히 지켜볼 것 (로그: `logs/macd_stdout_YYYY-MM-DD.log`, 상태: `macd_state.json`). 서킷브레이커
    (`daily_max_loss_pct` 30%)는 이 슬리브에도 동일하게 적용되니 큰 하루손실은 자동으로 막힘
