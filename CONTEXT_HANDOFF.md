@@ -15,7 +15,9 @@
 - 이 PC 특이사항: Windows 계정명에 한글(김형찬)이 포함되어 있어서 yfinance/pykrx/requests가
   SSL 인증서 경로를 못 찾는 문제가 있음 → `SSL_CERT_FILE`/`CURL_CA_BUNDLE` 환경변수를
   `C:\ca-certs\cacert.pem`으로 지정해야 정상 동작 (README "트러블슈팅" 섹션 참고).
-- **장중 자동 실행 중 (스케줄러 3세트, 완전 독립 - 슬리브마다 별도 시드/상태파일)**:
+- **장중 자동 실행 (스케줄러 3세트, 슬리브마다 별도 시드/상태파일/포지션장부)**.
+  **⚠️ 2026-10-01 13:50부터 `StockAutoTradingPaper`/`StockAutoTradingMacd`는 Disabled** -
+  슬리브 간 포지션 오염 수정(아래 "핵심 여정" 23번) 후 재활성화 대기 중. 발굴형 3개는 Ready:
   - `StockAutoTradingPaper`: 고정 10종목 워치리스트(whale_flow+rsi+변동성돌파+close_strength),
     평일 09:00~15:30 15분 간격, `run_paper_cycle.bat` → `python main.py --mode paper`
     (시드는 `config.yaml`의 `seed_capital` 100만원, `state.json`)
@@ -252,6 +254,40 @@
     MACD가 훨씬 자주 신호를 내는 걸 실증. 테스트 12개 추가(`tests/test_screening_patterns.py`).
     - 커밋·푸시 완료 (commit `7fbdfd4`): `.gitignore`, `config.yaml`, `main.py`, 신규
       `run_macd_cycle.bat`, `strategies/screening_patterns.py`, `tests/test_screening_patterns.py`
+23. **슬리브 간 포지션 오염 발견·수정 (2026-10-01)**: 세 슬리브(워치리스트/발굴형/MACD)는 현금
+    원장만 따로 두고 **KIS 계좌 하나를 공유**하는데, `KisBroker.get_positions()`가 계좌 전체
+    보유(`inquire-balance`)를 그대로 반환했음 → 한 슬리브의 청산 신호가 다른 슬리브가 산 주식을
+    팔아버림. 실제 발생: 13:24 MACD가 셀트리온 8주 매수 → 13:47 **워치리스트 슬리브의
+    whale_flow SELL이 그 8주를 매도**(자기가 산 적 없는데 pnl +339원 기록, 워치리스트 현금원장이
+    50만→196만원으로 부풀음) → 13:48 MACD가 5주 재매수. 두 슬리브가 같은 10종목 워치리스트를
+    쓰고 15분 주기가 겹쳐서 터진 것 - 설계상 "완전 독립"이라던 이전 서술은 현금에 한해서만 맞았음.
+    - **발견 경위**: `^C` 종료 확인용으로 13:45 사이클 결과를 보다가 수치(MACD 에쿼티 감소, 워치리스트
+      에쿼티 증가)가 이상해서 추적. 13:30 `^C`(종료코드 `3221225786`) 자체는 일회성으로 보임
+      (13:45 사이클은 둘 다 `0`으로 정상 종료, 원인은 확정 못 함)
+    - **조치 1 - 스케줄러 중지**: Paper/Macd를 Disabled (오염이 더 쌓이지 않게)
+    - **조치 2 - 코드 수정 (commit `1682a8a`)**: `broker/kis_broker.py` - 시드가 있는 슬리브는
+      자기가 체결한 `symbol → {quantity, avg_price}` 장부(`_owned`)를 갖고 `ledger_to_dict()`/
+      `restore_ledger()`로 `kis_cash_ledger.positions`에 영속화. `get_positions()`는 이 장부 몫만
+      반환(수량은 계좌 보유량으로 상한, 평단은 슬리브 자체 평단 - 계좌 평단은 슬리브들이 섞인 값).
+      장부에 없는 종목 SELL은 KIS에 보내지도 않고 거절. 체결 확인용 전후 수량 비교(`_account_qty`)는
+      계좌 전체 기준 유지. **`positions` 키 없는 옛 상태파일은 "아무것도 안 가짐"으로 취급**
+      (경고 로그) - 계좌에서 추측해 채우지 않음. 시드 없는 `KisBroker`(계좌 점검용)는 기존대로 전체
+      패스스루. 테스트 4개 추가 + 기존 SELL 테스트 2개 시딩 수정 → 전체 137개 통과
+    - **조치 3 - 상태 수동 보정** (백업 `state.json.bak-20261001`, `macd_state.json.bak-20261001`,
+      로컬에만 있고 gitignore 대상 아님이니 필요 없어지면 지울 것): 실계좌 보유(셀트리온 5주
+      @183,300)와 당일 체결 3건(`0000026645` 매수 8 @183,000 / `0000027617` 매도 8 @183,400 /
+      `0000027657` 매수 5 @183,300)으로 재구성. 매도대금 1,464,339원(수수료·세금 반영)을 원래 주인인
+      MACD 슬리브로 돌려줌 - 워치리스트 현금 1,965,233→**500,894원**(오염 전 로그 수치와 정확히
+      일치해서 보정 검증됨), 일일손익 0, `positions: {}` / MACD 현금 2,618,643→**4,082,982원**,
+      일일손익 +339원, `positions: 068270.KS 5주 @183,300`. `discovery_state.json`은 포지션 없어서
+      그대로(첫 실행 때 `positions: {}`로 저장됨)
+    - **교훈**: "별도 시드"를 현금만 나눠서 구현하면 공유 계좌에선 포지션이 안 나뉜다 - 슬리브를
+      더 추가할 때(또는 발굴형/MACD가 같은 종목을 노릴 때)마다 이 격리가 깨지지 않는지 확인할 것.
+      유닛테스트가 실제 `logs/trading.log`에 기록을 남기는 것도 확인됨(13:21의 `A: entry
+      (always_buy)` 등) - 로그 읽을 때 테스트 흔적과 구분
+    - **알려진 한계**: 지정가 BUY가 `_actual_bought_qty` 타임아웃(0체결 간주) 뒤에 늦게 체결되면 그
+      주식은 어느 슬리브 장부에도 없는 "고아"가 됨(예전엔 계좌에서 바로 보였음). 발견 시 수동으로
+      해당 슬리브 `positions`에 넣을 것
 
 ## 참고 자료 (발굴형 종가매매 설계 시 조사한 GitHub 프로젝트)
 
@@ -301,6 +337,9 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
   슬리브 중 가장 빠르게, 가장 명확하게 "자연 신호→실주문"이 실증된 사례
 
 ❌ 아직 안 됨:
+- **슬리브별 포지션 격리(23번)는 유닛테스트로만 검증** - 실제 KIS 사이클로는 아직 확인 안 됨.
+  Paper/Macd 스케줄러는 Disabled 상태 - 재활성화 전 `python main.py --mode macd` 1회 수동 실행으로
+  `macd_state.json`의 `positions`가 올바르게 이어지는지 확인할 것(모의계좌에 주문이 나갈 수 있음)
 - **고정 워치리스트/발굴형 슬리브의 자연 신호 "진입" 체결 미확인** - 청산은 2026-09-29에
   실증됐지만(위 참고), 진입은 여전히 강제 테스트(`scripts/force_entry_test.py`)로만 확인됨
   (고정 워치리스트 기준). MACD 슬리브는 이미 실증됨(바로 위 참고) - 나머지도 계속 관찰,
@@ -319,9 +358,9 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 
 ## Git 상태
 
-- 코드 변경은 전부 커밋·푸시 완료 (2026-10-01 재확인: `main`이 `origin/main`과 동기화, working
-  tree 깨끗). MACD 슬리브는 `7fbdfd4`, 핸드오프 갱신은 `b8f5423`. 테스트 133개 통과는 작성
-  시점 기록이며 이후 재실행은 안 함.
+- 코드 변경은 전부 커밋·푸시 완료. MACD 슬리브는 `7fbdfd4`, 포지션 격리 수정은 `1682a8a`
+  (테스트 137개 통과). 로컬에만 있는 untracked 파일: `state.json.bak-20261001`,
+  `macd_state.json.bak-20261001`(23번의 보정 전 백업).
   - `state.json`/`discovery_state.json`/`screening_state.json`/`macd_state.json`과 스케줄러
     등록(`StockAutoTradingPaper`, `StockDiscoveryScan1/2`, `StockDiscoveryFinal`,
     `StockAutoTradingMacd`)은 전부 로컬 머신 상태라 git에는 없음 (재현 커맨드는 위 "핵심 여정"
@@ -333,9 +372,9 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 
 ## 다음에 이어서 할 만한 것
 
-1. **스케줄러 `^C` 종료 확인** - 2026-10-01 13:30 실행 3건(Paper/Macd/Scan2)이 종료코드
-   `3221225786`(0xC000013A, Ctrl+C 종료)로 끝남. 원인 미확인(이전 세션 종료 시 프로세스가
-   같이 죽었을 가능성). 이후 사이클이 정상 완료되는지 로그로 확인할 것
+1. **Paper/Macd 스케줄러 재활성화** (최우선) - 먼저 `python main.py --mode macd` 수동 1회로
+   포지션 격리가 실사이클에서 동작하는지 확인(셀트리온 5주가 MACD 장부에서 이어지는지, 워치리스트
+   슬리브가 그걸 못 건드리는지) 후 `Enable-ScheduledTask`로 두 개 재활성화. 사용자 판단 사항
 2. **MACD 슬리브 관찰** - 변동성이 큰 공격적 전략이라(월최저 -21.3%, 손실 해 있었음) 처음 며칠은
    특히 지켜볼 것 (로그: `logs/macd_stdout_YYYY-MM-DD.log`, 상태: `macd_state.json`). 서킷브레이커
    (`daily_max_loss_pct` 30%)는 이 슬리브에도 동일하게 적용되니 큰 하루손실은 자동으로 막힘
