@@ -34,6 +34,8 @@ PAPER_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 
 _MAX_RETRIES = 3
 _RETRY_BACKOFF_SECONDS = 1.0
+_TOKEN_RATE_LIMIT_CODE = "EGW00133"  # "토큰 발급 잠시 후 다시 시도하세요(1분당 1회)"
+_TOKEN_RATE_LIMIT_WAIT_SECONDS = 61
 
 
 def get_with_retry(url: str, headers: dict, params: dict, timeout: int = 10) -> requests.Response:
@@ -163,17 +165,34 @@ class KisSession:
             self._access_token = cached
             return cached
 
-        response = requests.post(
-            f"{self.base_url}/oauth2/tokenP",
-            headers={"Content-Type": "application/json"},
-            json={
-                "grant_type": "client_credentials",
-                "appkey": self.app_key,
-                "appsecret": self.app_secret,
-            },
-            timeout=10,
-        )
-        if response.status_code != 200:
+        for attempt in range(2):
+            response = requests.post(
+                f"{self.base_url}/oauth2/tokenP",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "grant_type": "client_credentials",
+                    "appkey": self.app_key,
+                    "appsecret": self.app_secret,
+                },
+                timeout=10,
+            )
+            if response.status_code == 200:
+                break
+            if attempt == 0 and response.status_code == 403 and _TOKEN_RATE_LIMIT_CODE in response.text:
+                # KIS allows one issuance per minute per app key. Sleeves on
+                # the same schedule start simultaneously, so when the cached
+                # token expires the loser of the race lands here - the winner
+                # has by now saved a fresh token to the shared cache file.
+                logger.warning(
+                    "KIS token issuance rate-limited, waiting %ds for a sibling process's token",
+                    _TOKEN_RATE_LIMIT_WAIT_SECONDS,
+                )
+                time.sleep(_TOKEN_RATE_LIMIT_WAIT_SECONDS)
+                cached = self._load_cached_token()
+                if cached:
+                    self._access_token = cached
+                    return cached
+                continue
             raise RuntimeError(f"KIS token issuance failed: {response.status_code} {response.text}")
 
         body = response.json()

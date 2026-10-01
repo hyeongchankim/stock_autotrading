@@ -95,6 +95,66 @@ class TestKisSession(unittest.TestCase):
                 session.market_data_session()  # but real ones are needed for market data
 
 
+class TestKisTokenRateLimit(unittest.TestCase):
+    """Two sleeves started by the scheduler at the same minute race to issue
+    a token when the cache expires; KIS allows one issuance per minute, so
+    the loser gets 403 EGW00133 (seen 2026-10-01 14:30, crashed that cycle).
+    _load_cached_token/_save_token_cache are patched so the real
+    .kis_cache token file is never read or overwritten by these tests.
+    """
+
+    RATE_LIMITED = MagicMock(status_code=403, text='{"error_code":"EGW00133"}')
+
+    def setUp(self):
+        self.env_patcher = _env_patch()
+        self.env_patcher.start()
+        self.session = KisSession(env="demo")
+        self.save_patcher = patch.object(KisSession, "_save_token_cache")
+        self.save_patcher.start()
+
+    def tearDown(self):
+        self.save_patcher.stop()
+        self.env_patcher.stop()
+
+    @patch("broker.kis_auth.time.sleep")
+    @patch("broker.kis_auth.requests.post")
+    def test_rate_limited_uses_sibling_cached_token_without_reissuing(self, mock_post, mock_sleep):
+        mock_post.return_value = self.RATE_LIMITED
+        # cache is empty at first, then the sibling process has saved a token
+        with patch.object(KisSession, "_load_cached_token", side_effect=[None, "sibling-token"]):
+            self.assertEqual(self.session.get_access_token(), "sibling-token")
+        mock_sleep.assert_called_once()
+        self.assertEqual(mock_post.call_count, 1)
+
+    @patch("broker.kis_auth.time.sleep")
+    @patch("broker.kis_auth.requests.post")
+    def test_rate_limited_retries_issuance_when_cache_still_empty(self, mock_post, _mock_sleep):
+        ok = MagicMock(status_code=200, json=lambda: {"access_token": "new-token", "expires_in": 86400})
+        mock_post.side_effect = [self.RATE_LIMITED, ok]
+        with patch.object(KisSession, "_load_cached_token", return_value=None):
+            self.assertEqual(self.session.get_access_token(), "new-token")
+        self.assertEqual(mock_post.call_count, 2)
+
+    @patch("broker.kis_auth.time.sleep")
+    @patch("broker.kis_auth.requests.post")
+    def test_rate_limited_twice_raises(self, mock_post, _mock_sleep):
+        mock_post.return_value = self.RATE_LIMITED
+        with patch.object(KisSession, "_load_cached_token", return_value=None):
+            with self.assertRaises(RuntimeError):
+                self.session.get_access_token()
+        self.assertEqual(mock_post.call_count, 2)
+
+    @patch("broker.kis_auth.time.sleep")
+    @patch("broker.kis_auth.requests.post")
+    def test_other_403_fails_immediately_without_waiting(self, mock_post, mock_sleep):
+        mock_post.return_value = MagicMock(status_code=403, text='{"error_code":"EGW00123"}')
+        with patch.object(KisSession, "_load_cached_token", return_value=None):
+            with self.assertRaises(RuntimeError):
+                self.session.get_access_token()
+        mock_sleep.assert_not_called()
+        self.assertEqual(mock_post.call_count, 1)
+
+
 class TestKisBroker(unittest.TestCase):
     def setUp(self):
         self.env_patcher = _env_patch()
