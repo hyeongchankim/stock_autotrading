@@ -117,19 +117,37 @@ class KisBroker(BrokerBase):
         # match what the rest of the engine (watchlist strings) expects
         self._ticker_to_symbol = {_to_kis_ticker(s): s for s in (watchlist or [])}
         self._cash_ledger: float | None = seed_capital
+        # Sleeves (watchlist / discovery / macd) share ONE KIS account, so
+        # inquire-balance shows every sleeve's holdings mixed together - a
+        # sleeve whose strategy said SELL would otherwise liquidate shares
+        # another sleeve bought (seen 2026-10-01: the watchlist sleeve's
+        # whale_flow sold the MACD sleeve's 8 셀트리온 shares). When
+        # seed_capital scopes the cash, positions are scoped the same way:
+        # symbol -> {"quantity", "avg_price"} for what THIS sleeve filled.
+        # None = unscoped, get_positions() passes the whole account through.
+        self._owned: dict[str, dict] | None = {} if seed_capital is not None else None
         self.commission_pct = commission_pct
         self.sell_tax_pct = sell_tax_pct
 
     def ledger_to_dict(self) -> dict:
-        """Snapshot for StateStore, so the local cash ledger survives across
-        separate process runs. Empty when no seed_capital was configured.
+        """Snapshot for StateStore, so the local cash/position ledger
+        survives across separate process runs. Empty when no seed_capital
+        was configured.
         """
-        return {"cash": self._cash_ledger} if self._cash_ledger is not None else {}
+        if self._cash_ledger is None:
+            return {}
+        return {"cash": self._cash_ledger, "positions": self._owned}
 
     def restore_ledger(self, state: dict) -> None:
         if self._cash_ledger is None or not state:
             return
         self._cash_ledger = state.get("cash", self._cash_ledger)
+        if "positions" in state:
+            self._owned = {s: dict(p) for s, p in state["positions"].items()}
+        else:
+            # state written before position scoping: owns nothing until
+            # positions are seeded by hand - never guess from the account.
+            logger.warning("restore_ledger: state has no 'positions' - treating this sleeve as holding none")
 
     def _resolve_symbol(self, bare_ticker: str) -> str:
         return self._ticker_to_symbol.get(bare_ticker, bare_ticker)
@@ -176,6 +194,31 @@ class KisBroker(BrokerBase):
         return float(summary[0].get("dnca_tot_amt", 0))
 
     def get_positions(self) -> dict:
+        return self._scope(self._account_positions())
+
+    def _scope(self, account_positions: dict) -> dict:
+        """This sleeve's slice of the account's holdings (see _owned). Qty is
+        capped at what the account actually holds, avg_price is the
+        sleeve's own (the account's is blended across sleeves)."""
+        if self._owned is None:
+            return account_positions
+        held_qty = {_to_kis_ticker(s): p.quantity for s, p in account_positions.items()}
+        scoped = {}
+        for symbol, own in self._owned.items():
+            qty = min(own["quantity"], held_qty.get(_to_kis_ticker(symbol), 0))
+            if qty > 0:
+                scoped[symbol] = Position(symbol=symbol, quantity=qty, avg_price=own["avg_price"])
+        return scoped
+
+    def _account_qty(self, symbol: str) -> int:
+        """Whole-account quantity of symbol - used to detect fills by diffing
+        before/after an order, which must not be sleeve-scoped."""
+        ticker = _to_kis_ticker(symbol)
+        return sum(
+            p.quantity for s, p in self._account_positions().items() if _to_kis_ticker(s) == ticker
+        )
+
+    def _account_positions(self) -> dict:
         holdings, _summary = self._inquire_balance()
         positions = {}
         for item in holdings:
@@ -298,8 +341,7 @@ class KisBroker(BrokerBase):
         the way realized P&L accounting is.
         """
         for attempt in range(_MAX_RETRIES):
-            post_position = self.get_positions().get(symbol)
-            post_qty = post_position.quantity if post_position else 0
+            post_qty = self._account_qty(symbol)
             sold = pre_qty - post_qty
             if sold > 0:
                 return min(sold, requested_qty)
@@ -328,8 +370,7 @@ class KisBroker(BrokerBase):
         corrects next cycle the same way an unfilled SELL eventually would.
         """
         for attempt in range(_MAX_RETRIES):
-            post_position = self.get_positions().get(symbol)
-            post_qty = post_position.quantity if post_position else 0
+            post_qty = self._account_qty(symbol)
             bought = post_qty - pre_qty
             if bought > 0:
                 return min(bought, requested_qty)
@@ -354,7 +395,15 @@ class KisBroker(BrokerBase):
             return OrderResult(symbol, side, quantity, fill_price, False, "HOLD is not an order side")
         # captured for both sides now (previously SELL-only): BUY needs its
         # own pre-order quantity to detect an actual fill via _actual_bought_qty
-        pre_position = self.get_positions().get(symbol)
+        account_positions = self._account_positions()
+        pre_position = self._scope(account_positions).get(symbol)
+        if side == Signal.SELL and self._owned is not None:
+            if pre_position is None:
+                return OrderResult(
+                    symbol, side, quantity, fill_price, False,
+                    "this sleeve holds no position in the symbol - refusing to sell another sleeve's shares",
+                )
+            quantity = min(quantity, pre_position.quantity)
 
         if self.session.env == "real":
             logger.warning(
@@ -383,7 +432,8 @@ class KisBroker(BrokerBase):
             return OrderResult(symbol, side, quantity, fill_price, False, result_body.get("msg1", "order failed"))
 
         order_no = result_body.get("output", {}).get("ODNO", "")
-        pre_qty = pre_position.quantity if pre_position else 0
+        pre_ticker = _to_kis_ticker(symbol)
+        pre_qty = sum(p.quantity for s, p in account_positions.items() if _to_kis_ticker(s) == pre_ticker)
         actual_qty = quantity
         realized_pnl = 0.0
         if side == Signal.BUY:
@@ -405,5 +455,16 @@ class KisBroker(BrokerBase):
                 self._cash_ledger -= actual_qty * effective_price
             else:
                 self._cash_ledger += actual_qty * effective_price
+
+        if self._owned is not None:
+            own = self._owned.get(symbol, {"quantity": 0, "avg_price": 0.0})
+            if side == Signal.BUY:
+                qty = own["quantity"] + actual_qty
+                avg = (own["quantity"] * own["avg_price"] + actual_qty * fill_price) / qty
+                self._owned[symbol] = {"quantity": qty, "avg_price": avg}
+            elif own["quantity"] - actual_qty > 0:
+                self._owned[symbol] = {"quantity": own["quantity"] - actual_qty, "avg_price": own["avg_price"]}
+            else:
+                self._owned.pop(symbol, None)
 
         return OrderResult(symbol, side, actual_qty, fill_price, True, f"filled (order_no={order_no})", realized_pnl)

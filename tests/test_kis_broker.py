@@ -321,6 +321,9 @@ class TestKisBrokerCashLedger(unittest.TestCase):
         mock_post.return_value = MagicMock(
             status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "2"}}
         )
+        self.broker.restore_ledger(
+            {"cash": 500_000.0, "positions": {"005930.KS": {"quantity": 2, "avg_price": 70000.0}}}
+        )
         self.broker.place_order("005930.KS", Signal.SELL, 2, 75000.0)
         self.assertEqual(self.broker.get_cash_balance(), 500_000.0 + 2 * 75000.0)
 
@@ -337,10 +340,79 @@ class TestKisBrokerCashLedger(unittest.TestCase):
         self.assertEqual(self.broker.get_cash_balance(), 500_000.0)
 
     def test_ledger_to_dict_restore_round_trip(self):
-        snapshot = {"cash": 123456.0}
+        snapshot = {"cash": 123456.0, "positions": {"005930.KS": {"quantity": 3, "avg_price": 70000.0}}}
         self.broker.restore_ledger(snapshot)
         self.assertEqual(self.broker.get_cash_balance(), 123456.0)
         self.assertEqual(self.broker.ledger_to_dict(), snapshot)
+
+    @patch("broker.kis_auth.requests.get")
+    def test_get_positions_hides_other_sleeves_holdings(self, mock_get):
+        # the account holds 8 shares, but this sleeve never bought any
+        # (another sleeve did) - it must not see, let alone sell, them.
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "rt_cd": "0",
+                "output1": [{"pdno": "005930", "hldg_qty": "8", "pchs_avg_pric": "70000"}],
+                "output2": [{"dnca_tot_amt": "0"}],
+            },
+        )
+        self.assertEqual(self.broker.get_positions(), {})
+
+    @patch("broker.kis_auth.requests.get")
+    def test_get_positions_caps_at_own_qty_and_uses_own_avg_price(self, mock_get):
+        # account holds 8 (blended avg 70000) but this sleeve only bought 3 @ 65000
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "rt_cd": "0",
+                "output1": [{"pdno": "005930", "hldg_qty": "8", "pchs_avg_pric": "70000"}],
+                "output2": [{"dnca_tot_amt": "0"}],
+            },
+        )
+        self.broker.restore_ledger(
+            {"cash": 1.0, "positions": {"005930.KS": {"quantity": 3, "avg_price": 65000.0}}}
+        )
+        position = self.broker.get_positions()["005930.KS"]
+        self.assertEqual((position.quantity, position.avg_price), (3, 65000.0))
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_sell_of_unowned_symbol_is_refused_without_calling_kis(self, mock_get, mock_post):
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "rt_cd": "0",
+                "output1": [{"pdno": "005930", "hldg_qty": "8", "pchs_avg_pric": "70000"}],
+                "output2": [{"dnca_tot_amt": "0"}],
+            },
+        )
+        result = self.broker.place_order("005930.KS", Signal.SELL, 8, 75000.0)
+        self.assertFalse(result.filled)
+        mock_post.assert_not_called()
+        self.assertEqual(self.broker.get_cash_balance(), 500_000.0)
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_buy_then_sell_tracks_owned_qty_and_avg_price(self, mock_get, mock_post):
+        def _account(qty):
+            rows = [{"pdno": "005930", "hldg_qty": str(qty), "pchs_avg_pric": "1"}] if qty else []
+            return MagicMock(
+                status_code=200, json=lambda: {"rt_cd": "0", "output1": rows, "output2": [{"dnca_tot_amt": "0"}]}
+            )
+
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "1"}})
+        # another sleeve already holds 8; we buy 2 (account 8 -> 10), then 2 more (10 -> 12)
+        mock_get.side_effect = [_account(8), _account(10), _account(10), _account(12)]
+        self.broker.place_order("005930.KS", Signal.BUY, 2, 100.0)
+        self.broker.place_order("005930.KS", Signal.BUY, 2, 200.0)
+        owned = self.broker.ledger_to_dict()["positions"]["005930.KS"]
+        self.assertEqual((owned["quantity"], owned["avg_price"]), (4, 150.0))
+        # selling 4 (account 12 -> 8) must leave the other sleeve's 8 and clear ours
+        mock_get.side_effect = [_account(12), _account(8)]
+        result = self.broker.place_order("005930.KS", Signal.SELL, 4, 300.0)
+        self.assertEqual(result.quantity, 4)
+        self.assertEqual(self.broker.ledger_to_dict()["positions"], {})
 
     def test_restore_ledger_empty_state_is_noop(self):
         self.broker.restore_ledger({})
@@ -406,6 +478,9 @@ class TestKisBrokerCosts(unittest.TestCase):
         mock_get.side_effect = [pre_order, post_order]
         mock_post.return_value = MagicMock(
             status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "2"}}
+        )
+        self.broker.restore_ledger(
+            {"cash": 500_000.0, "positions": {"005930.KS": {"quantity": 1, "avg_price": 100.0}}}
         )
         result = self.broker.place_order("005930.KS", Signal.SELL, 1, 200.0)
         # effective sell price = 200 * (1 - 0.01 - 0.02) = 194
