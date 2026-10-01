@@ -42,7 +42,6 @@ from utils.logger import setup_logging
 from utils.notify import send_notification
 from utils.state_store import StateStore
 
-setup_logging()
 logger = logging.getLogger("main")
 
 STATE_FILE = Path(__file__).parent / "state.json"
@@ -580,6 +579,10 @@ def run_backtest(config: dict) -> None:
 
 
 def main() -> None:
+    # Not at import time: tests import main (test_hybrid_allocation), and an
+    # import-time call attached the real logs/trading.log to every test run -
+    # test warnings/entries showed up in the production log as if real.
+    setup_logging()
     parser = argparse.ArgumentParser(description="Stock auto-trading skeleton")
     parser.add_argument("--mode", choices=["paper", "backtest", "discovery", "macd"], default="paper")
     parser.add_argument("--config", default=str(Path(__file__).parent / "config.yaml"))
