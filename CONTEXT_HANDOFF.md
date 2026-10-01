@@ -304,8 +304,15 @@
       61초 대기 → 공유 캐시 재확인(먼저 시작한 쪽이 저장한 토큰이 있으면 그걸 사용) → 없으면 1회만
       재발급. 그래도 실패하거나 다른 403이면 기존처럼 즉시 예외. 테스트 4개 추가(실제
       `.kis_cache`는 건드리지 않게 `_load_cached_token`/`_save_token_cache` 패치) → 전체 141개 통과
-    - **검증 한계**: 유닛테스트로만 확인됨 - 실제 충돌은 다음 토큰 만료 시점에나 재현됨. 발생하면
-      로그에 `KIS token issuance rate-limited, waiting 61s ...` 경고가 남음(= 수정이 작동한 증거)
+    - **검증 한계**: 유닛테스트로만 확인됨 - 실제 충돌은 다음 토큰 만료 시점에나 재현됨.
+      **⚠️ 로그의 `KIS token issuance rate-limited, waiting 61s ...` 경고만으론 증거가 안 됨** -
+      유닛테스트(`TestKisTokenRateLimit`)가 운영 `logs/trading.log`에 같은 경고를 그대로 남김
+      (2026-10-01 15:03:18에 실제로 3줄 찍혔고, 같은 초에 테스트의 `A: entry (always_buy)` 로그가
+      있었음). 진짜 충돌이면 스케줄러 시작 시각(HH:00/15/30/45) 부근에 찍히고 테스트 로그가 같은
+      초에 없다 - 반드시 시각·주변 로그로 구분할 것
+    - **15:00 사이클 참고**: MACD는 KIS 모의서버 `inquire-balance` read timeout 3회 소진으로
+      크래시(종료코드 1) - 오늘 반복된 서버 불안정 패턴이고 격리/토큰 수정과 무관, 상태 파일은
+      그대로 유지됨(다음 사이클에서 재시도)
 
 ## 참고 자료 (발굴형 종가매매 설계 시 조사한 GitHub 프로젝트)
 
@@ -394,7 +401,8 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 1. **격리·토큰 수정 관찰** (최우선) - Paper/Macd는 같은 시각에 돎. `state.json`/`macd_state.json`의
    `positions`와 현금이 서로 안 섞이는지, 워치리스트 로그에 "refusing to sell another sleeve's
    shares"가 뜨는 경우(= 격리가 실제로 막은 사례), 로그에 "token issuance rate-limited"가 뜨는
-   경우(= 토큰 충돌 수정이 실제로 작동한 사례) 확인. 15:00 이후 사이클은 아직 결과 미확인
+   경우(= 토큰 충돌 수정이 실제로 작동한 사례 - 단 유닛테스트도 같은 로그를 남기니 시각으로 구분,
+   24번 참고) 확인. 15:15 이후 사이클은 아직 결과 미확인
 2. **MACD 슬리브 관찰** - 변동성이 큰 공격적 전략이라(월최저 -21.3%, 손실 해 있었음) 처음 며칠은
    특히 지켜볼 것 (로그: `logs/macd_stdout_YYYY-MM-DD.log`, 상태: `macd_state.json`). 서킷브레이커
    (`daily_max_loss_pct` 30%)는 이 슬리브에도 동일하게 적용되니 큰 하루손실은 자동으로 막힘
