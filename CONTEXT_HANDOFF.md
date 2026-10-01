@@ -250,10 +250,8 @@
     (평일 09:00~15:30 15분 간격, `StockAutoTradingPaper`와 동일 주기). **실제 KIS 데이터로 첫
     사이클부터 바로 진입 체결 확인**(셀트리온 068270.KS 8주 @183,000원) - 다른 슬리브들보다
     MACD가 훨씬 자주 신호를 내는 걸 실증. 테스트 12개 추가(`tests/test_screening_patterns.py`).
-    - **⚠️ 아직 커밋 안 됨** - 코드는 전부 동작 확인됐지만 git에는 반영 안 된 상태로 세션 종료.
-      다음 세션에서 가장 먼저 할 일: 변경사항 리뷰 후 커밋/푸시 (`.gitignore`, `config.yaml`,
-      `main.py`, 신규 `run_macd_cycle.bat`, `strategies/screening_patterns.py`,
-      `tests/test_screening_patterns.py`)
+    - 커밋·푸시 완료 (commit `7fbdfd4`): `.gitignore`, `config.yaml`, `main.py`, 신규
+      `run_macd_cycle.bat`, `strategies/screening_patterns.py`, `tests/test_screening_patterns.py`
 
 ## 참고 자료 (발굴형 종가매매 설계 시 조사한 GitHub 프로젝트)
 
@@ -309,8 +307,6 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
   능동적으로 더 할 일 없음.
 - **발굴형 종가매매의 자연 매매도 미확인** - 파이프라인(스캔→후보선정)은 실증됐지만 실제 매수
   신호가 나서 진입하는 것까진 아직 못 봄. 10/1부터 스케줄러(3개)가 돌면서 확인될 것
-- **MACD 슬리브 코드 전체가 아직 git에 커밋 안 됨** - 로컬에서는 동작 확인됐지만 push는커녕
-  commit도 안 된 상태 (위 "핵심 여정" 22번 참고) - 다음 세션 최우선 작업
 - `broker.provider: kis`가 지금 config.yaml에 켜진 상태 - 안 쓸 때는 `mock`으로 되돌리는 게 안전
 - 부분체결/체결확인(`get_daily_fills()`)은 엔진 로직에 연결 안 함 - 포지션 디프 방식으로 더
   가볍게 실제 위험(realized_pnl 정확도)을 해결해서 필요성이 낮아짐, 의도적 보류
@@ -323,14 +319,9 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 
 ## Git 상태
 
-- **⚠️ 커밋 안 된 변경사항 있음** (2026-10-01 세션 종료 시점) - 최신 커밋은 `5024a34`
-  (CONTEXT_HANDOFF.md 갱신)이지만, 그 이후 MACD 슬리브 작업(위 "핵심 여정" 21~22번)이
-  커밋/푸시 안 된 채 남아있음:
-  - 수정: `.gitignore`(`macd_state.json` 추가), `config.yaml`(`macd_sleeve` 섹션),
-    `main.py`(`run_macd_sleeve()`, `--mode macd`)
-  - 신규: `run_macd_cycle.bat`, `strategies/screening_patterns.py`, `tests/test_screening_patterns.py`
-  - `git status --short`로 확인 후 커밋할 것 - 테스트(133개)는 이미 통과 확인됨, 실제 KIS로
-    `--mode macd` 실행도 검증됨(셀트리온 체결) - 안전하게 커밋 가능한 상태
+- 코드 변경은 전부 커밋·푸시 완료 (2026-10-01 재확인: `main`이 `origin/main`과 동기화, working
+  tree 깨끗). MACD 슬리브는 `7fbdfd4`, 핸드오프 갱신은 `b8f5423`. 테스트 133개 통과는 작성
+  시점 기록이며 이후 재실행은 안 함.
   - `state.json`/`discovery_state.json`/`screening_state.json`/`macd_state.json`과 스케줄러
     등록(`StockAutoTradingPaper`, `StockDiscoveryScan1/2`, `StockDiscoveryFinal`,
     `StockAutoTradingMacd`)은 전부 로컬 머신 상태라 git에는 없음 (재현 커맨드는 위 "핵심 여정"
@@ -342,7 +333,9 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 
 ## 다음에 이어서 할 만한 것
 
-1. **MACD 슬리브 코드 커밋/푸시** (최우선, 위 "Git 상태" 참고) - 리뷰 후 바로 진행 가능한 상태
+1. **스케줄러 `^C` 종료 확인** - 2026-10-01 13:30 실행 3건(Paper/Macd/Scan2)이 종료코드
+   `3221225786`(0xC000013A, Ctrl+C 종료)로 끝남. 원인 미확인(이전 세션 종료 시 프로세스가
+   같이 죽었을 가능성). 이후 사이클이 정상 완료되는지 로그로 확인할 것
 2. **MACD 슬리브 관찰** - 변동성이 큰 공격적 전략이라(월최저 -21.3%, 손실 해 있었음) 처음 며칠은
    특히 지켜볼 것 (로그: `logs/macd_stdout_YYYY-MM-DD.log`, 상태: `macd_state.json`). 서킷브레이커
    (`daily_max_loss_pct` 30%)는 이 슬리브에도 동일하게 적용되니 큰 하루손실은 자동으로 막힘
