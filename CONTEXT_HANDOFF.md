@@ -290,6 +290,22 @@
     - **알려진 한계**: 지정가 BUY가 `_actual_bought_qty` 타임아웃(0체결 간주) 뒤에 늦게 체결되면 그
       주식은 어느 슬리브 장부에도 없는 "고아"가 됨(예전엔 계좌에서 바로 보였음). 발견 시 수동으로
       해당 슬리브 `positions`에 넣을 것
+    - **재활성화 후 관찰 (14:30/14:45 사이클)**: 두 슬리브의 `positions`/현금이 섞이지 않고 유지됨
+      (워치리스트 `cash=500,894 positions=[]`, MACD 셀트리온 5주·현금 4,082,982원, 에쿼티
+      ~5,002,482원, 신규 주문 없음). 단 워치리스트 쪽에 셀트리온 SELL 신호가 나서 실제로 거절되는
+      순간은 아직 못 봄
+24. **KIS 토큰 발급 동시 시작 충돌 발견·수정 (2026-10-01)**: 재활성화 직후 14:30 사이클에서
+    MACD 슬리브가 `KIS token issuance failed: 403 EGW00133`("토큰 발급 1분당 1회")으로 크래시.
+    Paper/Macd가 같은 시각(09:00, 09:15…)에 동시 시작해서, 토큰 캐시(`.kis_cache/token_*.json`,
+    약 24h 유효)가 만료된 순간 둘이 동시에 발급을 시도하면 한쪽이 막힘. 14:45에 자동 복구됐고 상태
+    오염은 없었음(그 사이클만 놓침) - 슬리브가 둘 이상 된 이후 생긴 문제라 앞으로 약 하루 한 번쯤
+    재발 가능했음. 크래시 알림은 텔레그램 타임아웃(회사망 SNI 차단)으로 못 나감.
+    - **수정 (commit `45a96fc`)**: `broker/kis_auth.py` `get_access_token()` - `403`+`EGW00133`이면
+      61초 대기 → 공유 캐시 재확인(먼저 시작한 쪽이 저장한 토큰이 있으면 그걸 사용) → 없으면 1회만
+      재발급. 그래도 실패하거나 다른 403이면 기존처럼 즉시 예외. 테스트 4개 추가(실제
+      `.kis_cache`는 건드리지 않게 `_load_cached_token`/`_save_token_cache` 패치) → 전체 141개 통과
+    - **검증 한계**: 유닛테스트로만 확인됨 - 실제 충돌은 다음 토큰 만료 시점에나 재현됨. 발생하면
+      로그에 `KIS token issuance rate-limited, waiting 61s ...` 경고가 남음(= 수정이 작동한 증거)
 
 ## 참고 자료 (발굴형 종가매매 설계 시 조사한 GitHub 프로젝트)
 
@@ -361,8 +377,8 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 
 ## Git 상태
 
-- 코드 변경은 전부 커밋·푸시 완료. MACD 슬리브는 `7fbdfd4`, 포지션 격리 수정은 `1682a8a`
-  (테스트 137개 통과). 로컬에만 있는 untracked 파일: `state.json.bak-20261001`,
+- 코드 변경은 전부 커밋·푸시 완료. MACD 슬리브는 `7fbdfd4`, 포지션 격리 수정은 `1682a8a`,
+  토큰 발급 충돌 수정은 `45a96fc` (테스트 141개 통과). 로컬에만 있는 untracked 파일: `state.json.bak-20261001`,
   `macd_state.json.bak-20261001`(23번의 보정 전 백업).
   - `state.json`/`discovery_state.json`/`screening_state.json`/`macd_state.json`과 스케줄러
     등록(`StockAutoTradingPaper`, `StockDiscoveryScan1/2`, `StockDiscoveryFinal`,
@@ -375,9 +391,10 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 
 ## 다음에 이어서 할 만한 것
 
-1. **재활성화 후 첫 사이클들 관찰** (최우선) - 14:30부터 Paper/Macd가 다시 같은 시각에 돎.
-   `state.json`/`macd_state.json`의 `positions`와 현금이 서로 안 섞이는지, 워치리스트 로그에
-   "refusing to sell another sleeve's shares"가 뜨는 경우(= 격리가 실제로 막은 사례) 확인
+1. **격리·토큰 수정 관찰** (최우선) - Paper/Macd는 같은 시각에 돎. `state.json`/`macd_state.json`의
+   `positions`와 현금이 서로 안 섞이는지, 워치리스트 로그에 "refusing to sell another sleeve's
+   shares"가 뜨는 경우(= 격리가 실제로 막은 사례), 로그에 "token issuance rate-limited"가 뜨는
+   경우(= 토큰 충돌 수정이 실제로 작동한 사례) 확인. 15:00 이후 사이클은 아직 결과 미확인
 2. **MACD 슬리브 관찰** - 변동성이 큰 공격적 전략이라(월최저 -21.3%, 손실 해 있었음) 처음 며칠은
    특히 지켜볼 것 (로그: `logs/macd_stdout_YYYY-MM-DD.log`, 상태: `macd_state.json`). 서킷브레이커
    (`daily_max_loss_pct` 30%)는 이 슬리브에도 동일하게 적용되니 큰 하루손실은 자동으로 막힘
