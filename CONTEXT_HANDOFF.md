@@ -16,9 +16,9 @@
   SSL 인증서 경로를 못 찾는 문제가 있음 → `SSL_CERT_FILE`/`CURL_CA_BUNDLE` 환경변수를
   `C:\ca-certs\cacert.pem`으로 지정해야 정상 동작 (README "트러블슈팅" 섹션 참고).
 - **장중 자동 실행 (스케줄러 3세트, 슬리브마다 별도 시드/상태파일/포지션장부)**.
-  (`StockAutoTradingPaper`/`StockAutoTradingMacd`는 2026-10-01 13:50~14:20 슬리브 간 포지션
-  오염 수정(아래 "핵심 여정" 23번) 동안 Disabled였다가 수동 검증 후 14:20에 재활성화됨 - 현재 5개
-  전부 Ready):
+  **⚠️ 2026-10-02 14:48부터 아래 스케줄러 5개 전부 Disabled** (사용자 요청 - KRX가 이 PC의 IP를
+  하루 차단한 사건, "핵심 여정" 26번). 재활성화 절차는 "다음에 이어서 할 만한 것" 1번. (참고:
+  Paper/Macd는 10/1 13:50~14:20에도 오염 수정 때문에 잠시 Disabled였음 - 23번):
   - `StockAutoTradingPaper`: 고정 10종목 워치리스트(whale_flow+rsi+변동성돌파+close_strength),
     평일 09:00~15:30 15분 간격, `run_paper_cycle.bat` → `python main.py --mode paper`
     (시드는 `config.yaml`의 `seed_capital` 100만원, `state.json`)
@@ -41,7 +41,7 @@
 | `risk.take_profit_pct` | **18%** (2026-09-30 7%→변경) | close_strength 추가 후 손익비 1:2로 재백테스트, 기존보다 수익·MDD 둘 다 개선 |
 | `risk.position_size_pct` | 30% | 스윕 검증 결과 최적점 (발굴형 슬리브는 별도로 20%, 아래 참고) |
 | `risk.daily_max_loss_pct` | 30% | 실제 손실(-172,000원)로 서킷브레이커 작동 검증됨 |
-| `strategies.trend_following.whale_flow` | **활성** | 외국인+기관 순매수 추종. 2026-09-29 실전에서 첫 자연 청산 확인(리노공업, +915원) |
+| `strategies.trend_following.whale_flow` | **⚠️ 임시 비활성 (2026-10-02, commit `77e58b9`)** - 원래는 활성 | 외국인+기관 순매수 추종. KRX IP 차단(26번) 동안 매 사이클 KRX 로그인 재시도를 멈추려고 `enabled: false`. **차단 해제 후 `true`로 복구할 것.** 2026-09-29 실전에서 첫 자연 청산 확인(리노공업, +915원) |
 | `strategies.trend_following.close_strength` | **활성 (신규)** | "종가매매" - 당일 종가강도+이평선. whale_flow/rsi/변동성돌파에 **추가**(대체 아님) |
 | 그 외 trend_following (ma_cross/bollinger/donchian/macd) | 전부 비활성 | whale_flow/close_strength로 대체됨 |
 | `strategies.mean_reversion.rsi`, `volatility_breakout` | 활성 | 유지 |
@@ -336,6 +336,48 @@
       원인 미확정
     - 오늘 모의계좌 실체결 총 3건(MACD 매수 8주 @183,000 / 워치리스트 슬리브의 오염 매도 8주
       @183,400 / MACD 매수 5주 @183,300)뿐 - 23번의 오염 사건이 전부
+26. **2026-10-02: 백테스트 연구 2건 + KRX IP 차단 사건 + 스케줄러 전체 중지**
+    - **10/2 오전~14:49 실사이클 관찰**: 격리 유지(워치리스트 `cash=500,894 positions={}`, MACD 셀트리온
+      5주, 발굴형 현금 500만원), 신규 주문 없음. **토큰 충돌 수정(`45a96fc`)이 실전에서 처음
+      작동**: 14:15:20(real 토큰)과 14:30:46(demo 토큰)에 `KIS token issuance rate-limited, waiting
+      61s` 경고가 찍혔고 두 사이클 다 정상 완료(`e60ab3b` 이후라 테스트 흔적 아님, 25번에서 예측한 시각과
+      일치). 부수 발견: **자정 로그 로테이션 충돌(무해)** - 09:00에 두 슬리브가 동시에 시작하면 한쪽의
+      `trading.log` → `trading.log.2026-10-01` 이름 변경이 `PermissionError [WinError 32]`로 실패해
+      `--- Logging error ---`가 stdout에 찍힘(파일엔 그 한 줄만 빠짐, 매매 영향 없음, 매일 아침 재현 가능)
+    - **백테스트 1 - 발굴형 후보에 패턴 필터 겹치기** (`backtest/discovery_overlay.py`, 커밋 `40782e9`):
+      KOSPI200+KOSDAQ150 347종목·2019-08~2026-10 일봉으로 발굴형 후보(가격 5,000원+, ±15%, 거래대금 30억+,
+      등락률 상위 5)를 재현하고 5개 패턴(골든크로스/MACD/RSI상승추세/52주신고가/정배열)을 겹쳐 실거래와
+      같은 `TradingEngine`으로 시뮬. **기준선 +342%/MDD-48% > 모든 필터 변형(+18%~+119%)**, RSI는 거래 0.
+      필터를 걸면 하루 후보가 0.4~4개로 줄어 투입 자금이 놀아서 불리한 면도 있음(노출 맞춤 비교는 안 함)
+    - **백테스트 2 - "아직 안 오른 종목을 미리 진입"** (`backtest/early_setup.py`, 같은 커밋): 사용자
+      아이디어("신호가 여러 개 겹치지만 아직 안 오른 종목"). 새 슬리브를 만들기 전에 조건부터 검증.
+      "안 오른" = 당일 ±3% & 5일 수익률 ≤5%, 신호 7개(골든크로스/MACD/RSI상승추세/52주신고가는 최근 3봉
+      안, 정배열/close_strength/거래량급증은 당일). **결론: 조건이 맞았다는 근거 없음 → 새 슬리브 안 만듦.**
+      점수(신호 개수)가 올라도 10일 수익률이 안 오름(0점 +0.61% … 4점 +0.52%), 개별 신호도 하루 단위로
+      맞춘 보수적 t-stat이 전부 ±1 안쪽(정배열 +0.84가 최대), "돌파 직전 압축" 정의(20일 고점 3% 이내·
+      변동성 축소·50일선 위)도 시장 평균보다 낮음(+0.77% vs +1.03%), 포트폴리오 시뮬에서도 **무작위 선택(+71%,
+      압축 풀 +91%)이 신호 선택(-11%~+82%)보다 좋음**. 오히려 "안 오른" 종목이 시장보다 덜 오름(+0.68% vs
+      +1.03%) = 이 시장·기간엔 모멘텀 성향이 더 강했다는 해석과 일치
+    - **두 백테스트 공통 한계 (절대 수익률은 믿지 말고 변형끼리 상대 비교만 볼 것)**: 유니버스가 오늘의 편입
+      종목(생존편향), 종가 체결 가정, 11:00/13:30/15:20 체크포인트 규칙 미반영, 기준선 MDD도 -48%. 필요하면
+      `python -m backtest.discovery_overlay`/`backtest.early_setup`로 재현(가격 캐시 `.bt_cache/`, gitignore).
+      실거래 발굴형은 `lookback_days: 100`이라 SMA200/52주 패턴은 계산 자체가 안 됨(패턴을 실제로 쓰려면
+      lookback을 늘려야 함). **whale_flow(실제로 가장 효과 있었던 조건)는 이 백테스트에 못 넣음**(아래)
+    - **🚨 KRX IP 차단 사건 (내가 일으킨 것)**: 백테스트 3단계로 whale_flow를 넣으려고 pykrx로 347종목
+      외국인·기관 순매수를 3병렬로 받다가(11:12 시작) 24종목 후 KRX가 거부 시작. 로그인 응답이
+      `에러페이지 - KRX Data Marketplace 이용 제한 안내: 자동화 수단을 통한 비정상 대량 조회가 감지되어
+      해당 IP의 접속이 일시적으로 제한 … 탐지일로부터 1일간 접속 제한, 해제 후 재탐지되면 재적용될 수 있음`
+      (이용약관 제10조 제2호가 자동 대량 수집 금지, 공식 경로는 화면 다운로드/데이터 상품/KRX Open API).
+      pykrx는 import 때 로그인하므로 **KRX를 쓰는 모든 것이 멎음** - 11:15 사이클부터 라이브 Paper/Macd가
+      매 사이클 `skipping whale flow enrichment ... Expecting value` 20건씩(whale_flow는 데이터 없으면
+      HOLD), 발굴형 Scan2(13:30)는 유니버스 조회(`get_universe`)에서 크래시(종료코드 1; Scan1(11:00)은
+      차단 전이라 정상). 해제 예상 **10/3(토) 11시 전후**(정확한 시각은 모름), 다음 거래일 장 시작 전엔 풀릴 가능성이 높음
+    - **조치(사용자 승인)**: (1) `whale_flow.enabled: false` 임시 비활성(`77e58b9`) - KRX 로그인 재시도
+      중단, (2) 14:48 스케줄러 5개 전부 Disabled(사용자 요청), (3) 커밋 전 `backtest/early_setup.py`의
+      **대량 수집기(`--fetch-whale`)를 코드에서 삭제** - 같은 사고 재발 방지, 수급 분석 단계는 캐시
+      (`.bt_cache/investor_flow.pkl`, 현재 24/347종목뿐이라 사실상 못 씀)가 있어야만 동작
+    - **교훈**: 연구용 대량 수집이라도 라이브 시스템과 같은 IP/계정이면 라이브가 같이 죽는다 - 외부 서비스
+      (KRX/KIS) 대량·병렬 호출 전에 약관/레이트리밋을 먼저 확인하고, 필요하면 사용자에게 먼저 물을 것
 
 ## 참고 자료 (발굴형 종가매매 설계 시 조사한 GitHub 프로젝트)
 
@@ -385,6 +427,12 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
   슬리브 중 가장 빠르게, 가장 명확하게 "자연 신호→실주문"이 실증된 사례
 
 ❌ 아직 안 됨:
+- **KRX IP 차단 중 / whale_flow 임시 비활성 / 스케줄러 5개 전부 Disabled** (26번) - 복구 안 하면 자동매매가
+  안 돎. 해제 확인 → `whale_flow.enabled: true` 복구 → 스케줄러 재활성화 순서(아래 "다음에 이어서" 1번)
+- **whale_flow를 넣은 "미리 진입" 백테스트(3단계)는 못 함** - KRX 차단으로 수급 데이터 24/347종목뿐. 공식
+  경로(KRX Open API/화면 다운로드)로 받아야 하며 그 전엔 결론 못 냄. 1·2단계(가격·거래량 신호만)는 "우위 없음"
+- 자정 로그 로테이션 충돌(`PermissionError` 한 줄, 26번) 미수정 - 무해하지만 매일 아침 재현 가능
+  (슬리브별 로그 파일 분리 등으로 고칠 수 있음, 우선순위 낮음)
 - **슬리브별 포지션 격리(23번)는 "SELL 거절" 경로만 유닛테스트로 검증** - 14:06 `--mode macd`와
   14:17 `--mode paper` 수동 실행, 그리고 14:30~15:30 스케줄러 사이클 내내(25번) MACD가 셀트리온
   5주를 장부로 이어받고 워치리스트 슬리브엔 안 보이는 것(주문 없음, 상태파일 유지)은 실계좌
@@ -410,8 +458,9 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 ## Git 상태
 
 - 코드 변경은 전부 커밋·푸시 완료. MACD 슬리브는 `7fbdfd4`, 포지션 격리 수정은 `1682a8a`,
-  토큰 발급 충돌 수정은 `45a96fc`, 테스트가 운영 로그에 쓰던 문제 수정은 `e60ab3b`
-  (테스트 141개 통과). 로컬에만 있는 untracked 파일: `state.json.bak-20261001`,
+  토큰 발급 충돌 수정은 `45a96fc`, 테스트가 운영 로그에 쓰던 문제 수정은 `e60ab3b`.
+  **10/2 커밋은 아직 푸시 안 됨**: 백테스트 연구 `40782e9`, whale_flow 임시 비활성 `77e58b9`
+  (테스트 149개 통과). 로컬에만 있는 untracked 파일: `state.json.bak-20261001`,
   `macd_state.json.bak-20261001`(23번의 보정 전 백업).
   - `state.json`/`discovery_state.json`/`screening_state.json`/`macd_state.json`과 스케줄러
     등록(`StockAutoTradingPaper`, `StockDiscoveryScan1/2`, `StockDiscoveryFinal`,
@@ -424,15 +473,18 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 
 ## 다음에 이어서 할 만한 것
 
+0. **(최우선) 자동매매 복구 - KRX 차단 해제 후에만** (26번): ① 해제 확인: `python -c "import pykrx"`가
+   "KRX 로그인 완료"만 찍고 끝나는지(차단 중이면 `JSONDecodeError`) - **확인은 한 번만, 반복 호출 금지**,
+   예상 10/3(토) 11시 전후 이후 ② `config.yaml`의 `whale_flow.enabled`를 `true`로 복구 ③ 스케줄러 5개
+   재활성화: `Enable-ScheduledTask -TaskName StockAutoTradingPaper`(그리고 `StockAutoTradingMacd`,
+   `StockDiscoveryScan1`, `StockDiscoveryScan2`, `StockDiscoveryFinal`) ④ 첫 사이클 로그에서
+   `skipping whale flow enrichment`가 사라졌는지, 발굴형 Scan1(11:00)이 유니버스 조회에 성공하는지 확인.
+   차단이 안 풀리거나 재적용되면 KRX 호출을 늘리지 말고 `whale_flow`를 끈 채로 운영
 1. **격리·토큰 수정 관찰 계속** (10/2 09:00~) - Paper/Macd는 같은 시각에 돎. 10/1은 마감까지
    격리가 유지됐음(25번). `state.json`/`macd_state.json`의 `positions`와 현금이 서로 안 섞이는지,
    워치리스트 로그에 "refusing to sell another sleeve's shares"가 뜨는 경우(= 격리가 실제로 막은
    사례), 로그에 "token issuance rate-limited"가 뜨는 경우(= 토큰 충돌 수정이 실제로 작동한 사례
-   - `e60ab3b` 이후 로그만 신뢰, 24번 참고) 확인. 토큰은 약 24h 주기이고 캐시는 만료 10분 전부터 재발급 대상이라, 10/1 장 마감 시점 캐시 기준
-   재충돌 가능 시점은 **10/2 14:15 사이클(real 토큰, expiry 14:17:36)과 14:30 사이클(demo 토큰,
-   expiry 14:30:31)** - 둘 다 Paper/Macd 동시 시작 시각이라 오늘 14:30과 같은 경합 조건(`.kis_cache/
-   token_*.json`의 `expiry`에서 확인한 값, 이후 다른 재발급이 있으면 달라짐). KIS 모의서버 timeout
-   크래시가 슬리브 증가와 관련 있는지(호출량)도 며칠 지켜볼 것
+   - `e60ab3b` 이후 로그만 신뢰, 24번 참고) 확인. 토큰 충돌 수정은 10/2 14:15/14:30에 실전 작동 확인됨(26번) - 토큰은 약 24h 주기라 다음 만료는 `.kis_cache/token_*.json`의 `expiry`로 확인 가능. KIS 모의서버 timeout 크래시가 슬리브 증가와 관련 있는지(호출량)도 며칠 지켜볼 것
 2. **MACD 슬리브 관찰** - 변동성이 큰 공격적 전략이라(월최저 -21.3%, 손실 해 있었음) 처음 며칠은
    특히 지켜볼 것 (로그: `logs/macd_stdout_YYYY-MM-DD.log`, 상태: `macd_state.json`). 서킷브레이커
    (`daily_max_loss_pct` 30%)는 이 슬리브에도 동일하게 적용되니 큰 하루손실은 자동으로 막힘
