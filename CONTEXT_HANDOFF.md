@@ -17,7 +17,8 @@
   `C:\ca-certs\cacert.pem`으로 지정해야 정상 동작 (README "트러블슈팅" 섹션 참고).
 - **장중 자동 실행 (스케줄러 3세트, 슬리브마다 별도 시드/상태파일/포지션장부)**.
   **⚠️ 2026-10-02 14:48부터 아래 스케줄러 5개 전부 Disabled** (사용자 요청 - KRX가 이 PC의 IP를
-  하루 차단한 사건, "핵심 여정" 26번). 재활성화 절차는 "다음에 이어서 할 만한 것" 1번. (참고:
+  하루 차단한 사건, "핵심 여정" 26번). **27번 이후 KRX를 쓰는 곳은 `whale_flow`뿐**(발굴형은 유니버스 캐시로 KRX
+  불필요) - whale_flow가 꺼져 있는 동안엔 스케줄러 5개 모두 KRX 없이 재활성화 가능. 재활성화 절차는 "다음에 이어서 할 만한 것" 1번. (참고:
   Paper/Macd는 10/1 13:50~14:20에도 오염 수정 때문에 잠시 Disabled였음 - 23번):
   - `StockAutoTradingPaper`: 고정 10종목 워치리스트(whale_flow+rsi+변동성돌파+close_strength),
     평일 09:00~15:30 15분 간격, `run_paper_cycle.bat` → `python main.py --mode paper`
@@ -379,6 +380,43 @@
     - **교훈**: 연구용 대량 수집이라도 라이브 시스템과 같은 IP/계정이면 라이브가 같이 죽는다 - 외부 서비스
       (KRX/KIS) 대량·병렬 호출 전에 약관/레이트리밋을 먼저 확인하고, 필요하면 사용자에게 먼저 물을 것
 
+27. **2026-10-02 오후: 웹 조사 + "야간 청산" 백테스트 + 포워드 테스트 로그 + 유니버스 캐시**
+    - **웹 조사 요약** (검색 요약 기반, 논문 본문은 안 읽음 - 방향 참고용): ① 52주 신고가 근접은 모멘텀을
+      설명하고 장기 반전이 없다는 George&Hwang 연구(월 단위 효과라 우리 10일 지평과 다름). ② 한국은 개별종목
+      모멘텀보다 **단기 반전**이 우세하고 모멘텀은 **업종 단위**에서 나타난다는 연구 다수. ③ 한국에도 **실적
+      서프라이즈 후 drift(PEAD)** 존재(미국과 비슷한 크기) - 외국인은 활용, 개인은 반대로 매매. ④ 기술적
+      분석은 데이터 스누핑 보정 시 우위가 사라지는 경우가 많음. ⑤ **오버나이트 효과**: 야간(종가→시가) 수익이
+      장중보다 크고 한국도 개장 후 반전(시가 강세 → 장중 하락), 한국 장 마지막 1~1.5시간엔 반전. ⑥ 급등+대량거래
+      종목은 이후 반전 연구. **아직 시험 안 한 후보**: PEAD(공식 DART API 필요), 업종 모멘텀(업종 분류 데이터 필요 -
+      KRX 말고). 무차별 오버나이트는 미국 평균 하룻밤 ~0.027% < 한국 왕복비용 ~0.21%라 조건 선별이 필수(내 계산)
+    - **야간 청산 백테스트** (`backtest/overnight.py`, 커밋 `a92dbc7`): 발굴형 진입(등락률 상위5 + 실거래 게이트
+      close_strength·거래량급증·ADX>=25)을 **다음 날 시가에 청산**하면? 건당 순수익(비용 0.21% 차감): 상위5
+      시가청산 **+0.13%**(유니버스 대비 +0.18%, t=6.0), 실거래 진입 시가청산 +0.11%(t=2.0) vs **다음 날 종가청산
+      -0.19%**(장중 시가→종가 -0.20~-0.31% = 갭 후 반락). 3일 +0.57%, 5일 +1.17%(건당은 오래 들수록 큼).
+      포트폴리오: 실거래 진입 시가청산 +36%/MDD-12.5% vs 종가청산 -48%. **결론: 같은 진입이면 종가 청산보다 시가
+      청산이 낫다(확인됨). 현재 스윙(손절9%/익절18%, +342%/MDD-48%, 편향 있음)을 대체할 근거는 아님.** 현재
+      게이트는 야간 기준 선별 효과 없음(게이트 없는 상위5 건당 +0.13 ≈ 게이트 +0.11, 거래수만 8,600→1,478)
+    - **야간 백테스트 한계 (가장 중요)**: **종가 룩어헤드** - 백테스트는 "종가 기준 등락률 순위·종가강세"를 알고
+      종가에 삼. 실거래는 15:20 가격으로 후보를 정하고 종가 단일가에 체결되므로 차이가 남(유불리 방향은 분봉 없이는
+      모름). + 생존편향, 정확한 종가/시가 체결 가정. 그래서 아래 포워드 테스트가 필요
+    - **포워드 테스트 로그** (`screening/forward_log.py`·`forward_report.py`, 커밋 `97c1f14`, 관찰 전용 - 주문 없음):
+      발굴형 Final(15:20)이 1차 필터 통과 후보 **전부**를 15:20 시점 가격·등락률 순위·거래대금·지속 여부와 함께
+      `forward_log.json`(로컬, gitignore)에 기록. 이후 첫 발굴형 실행(11:00)이 KIS 일봉으로 그날 종가/다음 거래일
+      시가·종가를 채움(확정값만: 종가 15:40 이후·시가 09:05 이후, 하루 1회, KIS 오류는 삼키고 같은 날 재시도,
+      주말·휴일은 "이후 첫 봉"으로 처리). `python -m screening.forward_report`(파일만 읽음)가 15:20→종가(룩어헤드
+      크기), 15:20→다음 시가(**실제 야간 수익, 비용 차감**), 시가→종가(반락), 상위 3/5/10·지속 후보별로 요약하고
+      백테스트 기준값(+0.13/+0.11, -0.20~-0.31)과 비교하라고 출력. **몇 주 쌓아야 의미 있음.** 테스트가 미래 날짜 봉을
+      "확정"으로 오판하던 버그를 잡아 수정. 실제 KIS 데이터로 임시 파일에 검증(스캔 30건→필터 9건 기록·종가 채우기
+      정상). `main.py` 연결부는 아래 유니버스 캐시 덕에 KRX 없이 `scan` 모드를 끝까지 실행해 확인(`final` 기록은
+      15:20 실행 때 처음 생김)
+    - **유니버스 캐시** (`screening/discover.py`, 커밋 `6542bb9`): `get_universe(max_age_days)`가 코스피200+코스닥150을
+      `universe_cache.json`(로컬, gitignore)에 캐시 - `discovery.universe_cache_days`(기본 7일) 이내면 **KRX 접속 0**,
+      만료 시 갱신, **갱신 실패(KRX 장애·IP 차단) 시 오래된 캐시를 경고와 함께 사용**(캐시도 없으면 예외),
+      너무 작은(<200종목) KRX 응답은 거부(캐시를 덮어쓰지 않음). 종목명 조회(~350 KRX 호출)는 어디서도 안 쓰여서
+      삭제(값은 종목코드). **지금 캐시는 10/2 10:30 차단 전 KRX 조회분(347종목: .KS 199/.KQ 148)을 백테스트 캐시에서
+      옮겨 만든 것** - 신규 상장 몇 종목(원래 351종목)은 갱신(10/9 이후, KRX 가능할 때)까지 빠질 수 있음.
+      **결과: 캐시가 유효한 동안(기본 7일) 발굴형 전 경로가 KRX 없이 돎**(KIS 스캔·일봉·주문만; 만료 후 갱신 때만 KRX 로그인 1회+조회 몇 건) - 11:00 `scan`을 차단 중에도 KRX 로그 0건으로 실행 확인
+
 ## 참고 자료 (발굴형 종가매매 설계 시 조사한 GitHub 프로젝트)
 
 - [KTHYEONG/k-closing-alpha](https://github.com/KTHYEONG/k-closing-alpha) - 정확히 같은 컨셉
@@ -427,8 +465,10 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
   슬리브 중 가장 빠르게, 가장 명확하게 "자연 신호→실주문"이 실증된 사례
 
 ❌ 아직 안 됨:
-- **KRX IP 차단 중 / whale_flow 임시 비활성 / 스케줄러 5개 전부 Disabled** (26번) - 복구 안 하면 자동매매가
-  안 돎. 해제 확인 → `whale_flow.enabled: true` 복구 → 스케줄러 재활성화 순서(아래 "다음에 이어서" 1번)
+- **스케줄러 5개 전부 Disabled / KRX IP 차단 중 / whale_flow 임시 비활성** (26번) - 복구 안 하면 자동매매가 안 돎.
+  스케줄러 재활성화는 KRX 없이 가능(27번), whale_flow 복구만 차단 해제 후("다음에 이어서" 0번)
+- **포워드 테스트(27번)는 데이터가 0건** - 발굴형 Final(15:20)이 돌아야 쌓이고 몇 주 모여야 `python -m screening.forward_report`가
+  의미 있음. 그 전까지 "야간 청산이 낫다"는 결론은 일봉 백테스트(룩어헤드 있음)에만 근거함
 - **whale_flow를 넣은 "미리 진입" 백테스트(3단계)는 못 함** - KRX 차단으로 수급 데이터 24/347종목뿐. 공식
   경로(KRX Open API/화면 다운로드)로 받아야 하며 그 전엔 결론 못 냄. 1·2단계(가격·거래량 신호만)는 "우위 없음"
 - 자정 로그 로테이션 충돌(`PermissionError` 한 줄, 26번) 미수정 - 무해하지만 매일 아침 재현 가능
@@ -459,8 +499,9 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 
 - 코드 변경은 전부 커밋·푸시 완료. MACD 슬리브는 `7fbdfd4`, 포지션 격리 수정은 `1682a8a`,
   토큰 발급 충돌 수정은 `45a96fc`, 테스트가 운영 로그에 쓰던 문제 수정은 `e60ab3b`.
-  **10/2 커밋은 아직 푸시 안 됨**: 백테스트 연구 `40782e9`, whale_flow 임시 비활성 `77e58b9`
-  (테스트 149개 통과). 로컬에만 있는 untracked 파일: `state.json.bak-20261001`,
+  **10/2 커밋은 아직 푸시 안 됨**: 백테스트 연구 `40782e9`, whale_flow 임시 비활성 `77e58b9`, 야간 청산 백테스트
+  `a92dbc7`, 포워드 테스트 로그 `97c1f14`, 유니버스 캐시 `6542bb9` (테스트 163개 통과). 로컬 전용 파일(gitignore):
+  `forward_log.json`, `universe_cache.json`, `.bt_cache/`. 로컬에만 있는 untracked 파일: `state.json.bak-20261001`,
   `macd_state.json.bak-20261001`(23번의 보정 전 백업).
   - `state.json`/`discovery_state.json`/`screening_state.json`/`macd_state.json`과 스케줄러
     등록(`StockAutoTradingPaper`, `StockDiscoveryScan1/2`, `StockDiscoveryFinal`,
@@ -473,13 +514,15 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 
 ## 다음에 이어서 할 만한 것
 
-0. **(최우선) 자동매매 복구 - KRX 차단 해제 후에만** (26번): ① 해제 확인: `python -c "import pykrx"`가
-   "KRX 로그인 완료"만 찍고 끝나는지(차단 중이면 `JSONDecodeError`) - **확인은 한 번만, 반복 호출 금지**,
-   예상 10/3(토) 11시 전후 이후 ② `config.yaml`의 `whale_flow.enabled`를 `true`로 복구 ③ 스케줄러 5개
-   재활성화: `Enable-ScheduledTask -TaskName StockAutoTradingPaper`(그리고 `StockAutoTradingMacd`,
-   `StockDiscoveryScan1`, `StockDiscoveryScan2`, `StockDiscoveryFinal`) ④ 첫 사이클 로그에서
-   `skipping whale flow enrichment`가 사라졌는지, 발굴형 Scan1(11:00)이 유니버스 조회에 성공하는지 확인.
-   차단이 안 풀리거나 재적용되면 KRX 호출을 늘리지 말고 `whale_flow`를 끈 채로 운영
+0. **(최우선) 자동매매 복구** (26·27번): 27번 이후 **KRX를 쓰는 건 `whale_flow`뿐**이라 두 갈래로 나뉨.
+   (a) **KRX 없이 바로 가능**: `config.yaml`의 `whale_flow.enabled: false`를 그대로 두고 스케줄러 5개 재활성화 -
+   `Enable-ScheduledTask -TaskName StockAutoTradingPaper`(그리고 `StockAutoTradingMacd`, `StockDiscoveryScan1`,
+   `StockDiscoveryScan2`, `StockDiscoveryFinal`). 발굴형 Final(15:20)이 돌아야 포워드 테스트 기록이 쌓임(27번).
+   Paper 슬리브는 whale_flow 없이(rsi·변동성돌파·close_strength)만 동작함에 유의.
+   (b) **whale_flow 복구는 KRX 차단 해제 후에만**(예상 10/3(토) 11시 전후, 정확한 시각은 모름): ① 해제 확인:
+   `python -c "import pykrx"`가 "KRX 로그인 완료"만 찍고 끝나는지(차단 중이면 `JSONDecodeError`) - **확인은 한 번만,
+   반복 호출 금지** ② `whale_flow.enabled: true` 복구 ③ 첫 사이클 로그에서 `skipping whale flow enrichment`가
+   사라졌는지 확인. 안 풀리거나 재적용되면 KRX 호출을 늘리지 말고 `whale_flow`를 끈 채로 운영
 1. **격리·토큰 수정 관찰 계속** (10/2 09:00~) - Paper/Macd는 같은 시각에 돎. 10/1은 마감까지
    격리가 유지됐음(25번). `state.json`/`macd_state.json`의 `positions`와 현금이 서로 안 섞이는지,
    워치리스트 로그에 "refusing to sell another sleeve's shares"가 뜨는 경우(= 격리가 실제로 막은
