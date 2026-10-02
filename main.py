@@ -26,6 +26,7 @@ from engine.trading_engine import TradingEngine
 from portfolio.buy_and_hold import BuyAndHoldSleeve
 from risk.risk_manager import RiskManager
 from screening.checkpoint_store import persistent_candidates, record_checkpoint
+from screening.forward_log import fill_outcomes, record_candidates
 from screening.discover import filter_candidates, get_universe, scan_market
 from strategies.close_strength import CloseStrengthStrategy
 from strategies.mean_reversion import RSIStrategy, VolatilityBreakoutStrategy
@@ -48,6 +49,7 @@ STATE_FILE = Path(__file__).parent / "state.json"
 DISCOVERY_STATE_FILE = Path(__file__).parent / "discovery_state.json"
 MACD_STATE_FILE = Path(__file__).parent / "macd_state.json"
 SCREENING_STATE_FILE = Path(__file__).parent / "screening_state.json"
+FORWARD_LOG_FILE = Path(__file__).parent / "forward_log.json"
 
 
 def load_config(path: str) -> dict:
@@ -393,6 +395,13 @@ def run_discovery(config: dict, checkpoint: str) -> None:
     kis_cfg = config.get("broker", {}).get("kis", {})
     env = kis_cfg.get("env", "demo")
 
+    # forward test (screening/forward_log.py): fill in past candidates' outcomes first, before
+    # anything that needs KRX, so a KRX outage can't stop it. Best-effort - never blocks trading.
+    try:
+        fill_outcomes(StateStore(FORWARD_LOG_FILE), KisDataFeed(env=env))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("forward log: outcome fill skipped (%s)", exc)
+
     universe = get_universe()
     session = KisSession(env=env)
     scan = scan_market(session, min_price=disc_cfg["min_price"], max_change_pct=disc_cfg["max_change_pct"])
@@ -418,6 +427,11 @@ def run_discovery(config: dict, checkpoint: str) -> None:
         "discovery final candidates (%d+ checkpoints required): %s",
         disc_cfg["min_checkpoints"], final_candidates,
     )
+    try:
+        logged = record_candidates(StateStore(FORWARD_LOG_FILE), date.today(), today_candidates, set(qualified))
+        logger.info("forward log: recorded %d scan candidates (15:20 prices)", logged)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("forward log: recording skipped (%s)", exc)
 
     broker = KisBroker(
         env=env, watchlist=list(universe.keys()), seed_capital=disc_cfg["seed_capital"],
