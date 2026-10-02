@@ -134,6 +134,8 @@ discovery:
   checkpoints: ["11:00", "13:30", "15:20"]   # 하루 중 스캔 시점 - 15:20이 최종(실제 매매) 체크포인트
   min_checkpoints: 2         # 이 중 최소 2번 이상 후보로 잡혀야 최종 후보로 인정 (마감 직전 반짝 급등 배제)
   max_candidates: 5          # 최종 후보 중 등락률 상위 몇 개까지만 매매할지 (position_size_pct와 짝)
+  universe_cache_days: 7     # 유니버스(코스피200+코스닥150)를 KRX에서 받아 universe_cache.json에 캐시 - 이 일수 이내면 KRX 호출 없음.
+                              # 갱신 실패(KRX 장애/IP 차단) 시엔 오래된 캐시를 경고와 함께 사용 (2026-10-02 KRX IP 차단 사건 이후 추가)
   close_strength_ma_period: 20
   close_strength_position_pct: 0.8
   # 청산은 스윙형 - 기존 risk.stop_loss_pct/take_profit_pct/daily_max_loss_pct 그대로 재사용,

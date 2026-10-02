@@ -402,7 +402,7 @@ def run_discovery(config: dict, checkpoint: str) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("forward log: outcome fill skipped (%s)", exc)
 
-    universe = get_universe()
+    universe = get_universe(max_age_days=disc_cfg.get("universe_cache_days", 7))
     session = KisSession(env=env)
     scan = scan_market(session, min_price=disc_cfg["min_price"], max_change_pct=disc_cfg["max_change_pct"])
     today_candidates = filter_candidates(scan, universe, min_trading_value=disc_cfg["min_trading_value"])

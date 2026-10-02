@@ -2,7 +2,7 @@
 - screens KOSPI200+KOSDAQ150 instead of trading a fixed watchlist.
 
 Pipeline (see main.py's run_discovery / config.yaml's `discovery` section):
-1. get_universe() - KOSPI200+KOSDAQ150 constituent tickers (pykrx)
+1. get_universe() - KOSPI200+KOSDAQ150 constituent tickers (pykrx, disk-cached)
 2. scan_market() - one KIS API call ranking the whole market by today's
    price change, with exclusion flags already applied server-side
 3. filter_candidates() - intersect with the universe and apply the
@@ -21,7 +21,10 @@ noise through instead of raising an error.
 """
 from __future__ import annotations
 
+import json
 import logging
+from datetime import date
+from pathlib import Path
 
 import pandas as pd
 
@@ -33,19 +36,67 @@ _FLUCTUATION_TR_ID = "FHPST01700000"  # same code for real and paper - see modul
 _FLUCTUATION_SCR_DIV_CODE = "20170"
 
 
-def get_universe() -> dict[str, str]:
-    """Returns {yfinance-style symbol: 종목명} for every KOSPI200 (index
-    "1028") + KOSDAQ150 (index "2203") constituent - about 350 tickers.
-    Requires a KRX Information Data System login (KRX_ID/KRX_PW), same as
-    the whale-flow data source (data/krx_investor_feed.py).
-    """
+UNIVERSE_CACHE = Path(__file__).resolve().parent.parent / "universe_cache.json"
+_MIN_UNIVERSE_SIZE = 200  # KOSPI200+KOSDAQ150 is ~350; far fewer means a bad/partial KRX response
+
+
+def _fetch_universe() -> dict[str, str]:
+    """KOSPI200 (index "1028") + KOSDAQ150 ("2203") constituents straight from
+    KRX (pykrx - needs KRX_ID/KRX_PW; importing pykrx itself logs in). Names are
+    not looked up (nothing uses them, and it would be ~350 extra KRX calls), so
+    the value is just the ticker code."""
     from pykrx import stock
 
     universe: dict[str, str] = {}
     for index_code, suffix in (("1028", ".KS"), ("2203", ".KQ")):
         for ticker in stock.get_index_portfolio_deposit_file(index_code):
-            universe[f"{ticker}{suffix}"] = stock.get_market_ticker_name(ticker)
+            universe[f"{ticker}{suffix}"] = ticker
+    if len(universe) < _MIN_UNIVERSE_SIZE:
+        raise ValueError(f"KRX returned only {len(universe)} index constituents")
     return universe
+
+
+def get_universe(max_age_days: int = 7, cache_path: Path = UNIVERSE_CACHE) -> dict[str, str]:
+    """{yfinance-style symbol: ticker} for the discovery universe, cached on disk.
+
+    The index changes only a few times a year, but this used to hit KRX on every
+    discovery run (3x/day) - and on 2026-10-02 KRX banned the PC's IP for a day for
+    automated query volume (see CONTEXT_HANDOFF). So: a cache younger than
+    `max_age_days` is used without touching KRX at all; an older one is refreshed,
+    and if the refresh fails (outage, ban) the stale cache is used with a warning
+    rather than stopping the sleeve. With no cache and no KRX, the error propagates.
+    """
+    cached = _load_universe_cache(cache_path)
+    if cached is not None:
+        fetched_on, universe = cached
+        if (date.today() - fetched_on).days <= max_age_days:
+            return universe
+    try:
+        fresh = _fetch_universe()
+    except Exception as exc:  # noqa: BLE001 - any KRX failure falls back to the cache
+        if cached is None:
+            raise
+        logger.warning(
+            "KRX universe refresh failed (%s) - using the cache from %s (%d days old)",
+            exc, cached[0], (date.today() - cached[0]).days,
+        )
+        return cached[1]
+    cache_path.write_text(
+        json.dumps({"fetched_on": date.today().isoformat(), "universe": fresh}, ensure_ascii=False, indent=1),
+        encoding="utf-8",
+    )
+    return fresh
+
+
+def _load_universe_cache(path: Path) -> tuple[date, dict[str, str]] | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        universe = raw["universe"]
+        if len(universe) < _MIN_UNIVERSE_SIZE:
+            return None
+        return date.fromisoformat(raw["fetched_on"]), universe
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def scan_market(
