@@ -9,3 +9,4 @@ state.json
 discovery_state.json
 screening_state.json
 macd_state.json
+.bt_cache/
