@@ -37,6 +37,7 @@ _DAILY_FILLS_TR_ID_REAL = "TTTC0081R"  # only covers the last 3 months - fine fo
 
 _MAX_RETRIES = 3
 _RETRY_BACKOFF_SECONDS = 1.0
+_POSITIONS_TTL_SECONDS = 20.0  # see KisBroker.get_positions
 
 
 @dataclass
@@ -128,6 +129,7 @@ class KisBroker(BrokerBase):
         self._owned: dict[str, dict] | None = {} if seed_capital is not None else None
         self.commission_pct = commission_pct
         self.sell_tax_pct = sell_tax_pct
+        self._positions_cache: tuple[float, dict] | None = None
 
     def ledger_to_dict(self) -> dict:
         """Snapshot for StateStore, so the local cash/position ledger
@@ -141,6 +143,7 @@ class KisBroker(BrokerBase):
     def restore_ledger(self, state: dict) -> None:
         if self._cash_ledger is None or not state:
             return
+        self._positions_cache = None
         self._cash_ledger = state.get("cash", self._cash_ledger)
         if "positions" in state:
             self._owned = {s: dict(p) for s, p in state["positions"].items()}
@@ -194,7 +197,21 @@ class KisBroker(BrokerBase):
         return float(summary[0].get("dnca_tot_amt", 0))
 
     def get_positions(self) -> dict:
-        return self._scope(self._account_positions())
+        """This sleeve's positions, cached for a few seconds. The engine asks
+        for them several times per symbol per cycle, and every uncached call is a
+        KIS inquire-balance round trip - on the flaky demo server that was ~4N
+        calls per cycle and the main cause of "failed after 3 attempts" crashes
+        (worse with a dynamic watchlist). Positions only change through this
+        broker's own orders (place_order drops the cache), and fill detection
+        reads the account directly via _account_positions/_account_qty, never
+        through this cache.
+        """
+        now = time.monotonic()
+        if self._positions_cache is not None and now - self._positions_cache[0] < _POSITIONS_TTL_SECONDS:
+            return dict(self._positions_cache[1])
+        positions = self._scope(self._account_positions())
+        self._positions_cache = (now, positions)
+        return dict(positions)
 
     def _scope(self, account_positions: dict) -> dict:
         """This sleeve's slice of the account's holdings (see _owned). Qty is
@@ -432,6 +449,7 @@ class KisBroker(BrokerBase):
             return OrderResult(symbol, side, quantity, fill_price, False, result_body.get("msg1", "order failed"))
 
         order_no = result_body.get("output", {}).get("ODNO", "")
+        self._positions_cache = None  # the order was accepted: positions are about to change
         pre_ticker = _to_kis_ticker(symbol)
         pre_qty = sum(p.quantity for s, p in account_positions.items() if _to_kis_ticker(s) == pre_ticker)
         actual_qty = quantity

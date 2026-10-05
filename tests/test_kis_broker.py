@@ -754,5 +754,65 @@ class TestKisBrokerPartialFill(unittest.TestCase):
         self.assertEqual(result.quantity, 3)  # capped at requested, not the full 10 sold
 
 
+
+class TestPositionsCache(unittest.TestCase):
+    """get_positions() is cached for a few seconds (every uncached call is a KIS
+    inquire-balance round trip), but must never serve a stale view after this
+    broker's own order, and fill detection must always read fresh."""
+
+    def setUp(self):
+        self.env_patcher = _env_patch()
+        self.env_patcher.start()
+        self.token_patcher = patch("broker.kis_auth.KisSession.get_access_token", return_value="fake-token")
+        self.token_patcher.start()
+        self.broker = KisBroker(env="demo", watchlist=["005930.KS"], seed_capital=500_000.0)
+        self.broker.restore_ledger(
+            {"cash": 500_000.0, "positions": {"005930.KS": {"quantity": 2, "avg_price": 70000.0}}}
+        )
+
+    def tearDown(self):
+        self.token_patcher.stop()
+        self.env_patcher.stop()
+
+    @staticmethod
+    def _account(qty):
+        rows = [{"pdno": "005930", "hldg_qty": str(qty), "pchs_avg_pric": "70000"}] if qty else []
+        return MagicMock(status_code=200, json=lambda: {"rt_cd": "0", "output1": rows, "output2": [{"dnca_tot_amt": "0"}]})
+
+    @patch("broker.kis_auth.requests.get")
+    def test_repeated_reads_within_ttl_make_one_api_call(self, mock_get):
+        mock_get.return_value = self._account(2)
+        for _ in range(5):
+            self.assertEqual(self.broker.get_positions()["005930.KS"].quantity, 2)
+        self.assertEqual(mock_get.call_count, 1)
+
+    @patch("broker.kis_broker.time.monotonic")
+    @patch("broker.kis_auth.requests.get")
+    def test_expired_cache_is_refetched(self, mock_get, mock_clock):
+        mock_get.side_effect = [self._account(2), self._account(1)]
+        mock_clock.return_value = 1000.0
+        self.assertEqual(self.broker.get_positions()["005930.KS"].quantity, 2)
+        mock_clock.return_value = 1000.0 + 21.0  # past the 20s TTL
+        self.assertEqual(self.broker.get_positions()["005930.KS"].quantity, 1)
+        self.assertEqual(mock_get.call_count, 2)
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_an_accepted_order_drops_the_cache(self, mock_get, mock_post):
+        # account: 2 held (read + cached), sell 2 -> fill check sees 0 -> next read must be fresh and empty
+        mock_get.side_effect = [self._account(2), self._account(2), self._account(0), self._account(0)]
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "1"}})
+        self.assertEqual(self.broker.get_positions()["005930.KS"].quantity, 2)  # call 1, now cached
+        self.broker.place_order("005930.KS", Signal.SELL, 2, 75000.0)  # calls 2 (pre) and 3 (fill check)
+        self.assertEqual(self.broker.get_positions(), {})  # call 4: fresh, not the cached 2
+
+    @patch("broker.kis_auth.requests.get")
+    def test_restore_ledger_drops_the_cache(self, mock_get):
+        mock_get.side_effect = [self._account(2), self._account(2)]
+        self.broker.get_positions()
+        self.broker.restore_ledger({"cash": 1.0, "positions": {}})
+        self.assertEqual(self.broker.get_positions(), {})  # scoped view re-read, ledger now owns nothing
+        self.assertEqual(mock_get.call_count, 2)
+
 if __name__ == "__main__":
     unittest.main()
