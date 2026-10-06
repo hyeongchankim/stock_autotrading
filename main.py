@@ -26,6 +26,7 @@ from engine.trading_engine import TradingEngine
 from portfolio.buy_and_hold import BuyAndHoldSleeve
 from risk.risk_manager import RiskManager
 from screening.checkpoint_store import persistent_candidates, record_checkpoint
+from data.market_calendar import market_closed_today
 from screening.dynamic_watchlist import current_movers, merge_with_held
 from screening.forward_log import fill_outcomes, record_candidates
 from screening.discover import filter_candidates, get_universe, scan_market
@@ -267,7 +268,19 @@ def dynamic_symbols(config: dict, broker: BrokerBase, strategy_seed: float) -> l
     return symbols
 
 
+def market_closed(config: dict) -> bool:
+    """True when KIS positively shows today is not a trading day (a holiday the weekday-only
+    scheduler doesn't know about) - the run then does nothing instead of trading on stale bars."""
+    if config.get("broker", {}).get("provider") != "kis":
+        return False
+    env = config.get("broker", {}).get("kis", {}).get("env", "demo")
+    return market_closed_today(KisDataFeed(env=env))
+
+
 def run_paper(config: dict) -> None:
+    if market_closed(config):
+        logger.info("market closed today (no daily bar for the reference stock) - skipping the paper cycle")
+        return
     total_seed = config["seed_capital"]
     alloc_pct = strategy_allocation_pct(config)
     strategy_seed = total_seed * alloc_pct
@@ -363,6 +376,9 @@ def run_macd_sleeve(config: dict) -> None:
     sleeve_cfg = config.get("macd_sleeve", {})
     if not sleeve_cfg.get("enabled", False):
         return
+    if market_closed(config):
+        logger.info("market closed today (no daily bar for the reference stock) - skipping the macd cycle")
+        return
 
     seed = sleeve_cfg["seed_capital"]
     broker = build_broker(config, seed_capital=seed)
@@ -446,6 +462,10 @@ def run_discovery(config: dict, checkpoint: str) -> None:
         fill_outcomes(StateStore(FORWARD_LOG_FILE), KisDataFeed(env=env))
     except Exception as exc:  # noqa: BLE001
         logger.warning("forward log: outcome fill skipped (%s)", exc)
+
+    if market_closed(config):  # no scan/checkpoint/forward-log row for a day with no trading
+        logger.info("market closed today (no daily bar for the reference stock) - skipping discovery %s", checkpoint)
+        return
 
     universe = get_universe(max_age_days=disc_cfg.get("universe_cache_days", 7))
     session = KisSession(env=env)
