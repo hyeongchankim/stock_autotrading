@@ -26,6 +26,7 @@ from engine.trading_engine import TradingEngine
 from portfolio.buy_and_hold import BuyAndHoldSleeve
 from risk.risk_manager import RiskManager
 from screening.checkpoint_store import persistent_candidates, record_checkpoint
+from screening.dynamic_watchlist import current_movers, merge_with_held
 from screening.forward_log import fill_outcomes, record_candidates
 from screening.discover import filter_candidates, get_universe, scan_market
 from strategies.close_strength import CloseStrengthStrategy
@@ -178,7 +179,7 @@ def build_volume_filter(config: dict) -> VolumeFilter | None:
     return VolumeFilter(window=vf_cfg["window"], multiplier=vf_cfg["multiplier"])
 
 
-def build_data_feed(config: dict) -> DataFeedBase:
+def build_data_feed(config: dict, allow_whale: bool = True) -> DataFeedBase:
     """yfinance by default, or the real KIS quote API when broker.provider
     is "kis" (same env - demo/real - as the broker). When whale_flow is
     enabled, wraps whichever base feed in WhaleEnrichedDataFeed so every
@@ -194,7 +195,7 @@ def build_data_feed(config: dict) -> DataFeedBase:
         base_feed = YFinanceDataFeed()
 
     whale_cfg = config["strategies"]["trend_following"].get("whale_flow", {})
-    if not whale_cfg.get("enabled", False):
+    if not allow_whale or not whale_cfg.get("enabled", False):
         return base_feed
     return WhaleEnrichedDataFeed(base_feed, KrxInvestorFlowFeed())
 
@@ -232,14 +233,49 @@ def strategy_allocation_pct(config: dict) -> float:
     return hybrid_cfg.get("strategy_allocation_pct", 1.0)
 
 
+def dynamic_symbols(config: dict, broker: BrokerBase, strategy_seed: float) -> list[str]:
+    """Symbols the watchlist sleeve evaluates this cycle when dynamic_watchlist is
+    on: today's strongest affordable movers from the discovery scan, plus whatever
+    this sleeve already holds. Any problem degrades to "held positions only" - exits
+    keep being checked, there are just no new entries - never to a crash.
+    """
+    held = list(broker.get_positions())
+    session = getattr(broker, "session", None)
+    if session is None:
+        logger.warning("dynamic watchlist needs the KIS broker for its market scan - evaluating held positions only")
+        return held
+
+    disc_cfg, dyn_cfg = config["discovery"], config["dynamic_watchlist"]
+    max_price = dyn_cfg.get("max_price") or strategy_seed * config["risk"]["position_size_pct"]
+    try:
+        universe = get_universe(max_age_days=disc_cfg.get("universe_cache_days", 7))
+        movers = current_movers(session, universe, disc_cfg, dyn_cfg["max_candidates"], max_price)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("dynamic watchlist: market scan failed (%s) - evaluating held positions only", exc)
+        return held
+
+    symbols = merge_with_held(movers, held)
+    logger.info(
+        "dynamic watchlist: %d movers (<= %.0f KRW/share) + %d held: %s",
+        len(movers), max_price, len(symbols) - len(movers), ", ".join(symbols),
+    )
+    return symbols
+
+
 def run_paper(config: dict) -> None:
     total_seed = config["seed_capital"]
     alloc_pct = strategy_allocation_pct(config)
     strategy_seed = total_seed * alloc_pct
     bh_seed = total_seed - strategy_seed
 
+    dynamic = config.get("dynamic_watchlist", {}).get("enabled", False)
+    if dynamic and config["strategies"]["trend_following"].get("whale_flow", {}).get("enabled", False):
+        # a different symbol set every cycle would mean KRX calls for every candidate every cycle -
+        # that volume is what got the PC's IP banned (CONTEXT_HANDOFF, 2026-10-02). Skip the KRX feed.
+        logger.warning("dynamic_watchlist is on: whale_flow gets no investor data (KRX is not called for dynamic symbols)")
+
     broker = build_broker(config, seed_capital=strategy_seed)
-    data_feed = build_data_feed(config)
+    data_feed = build_data_feed(config, allow_whale=not dynamic)
     engine = build_engine(config, broker, data_feed, seed_capital=strategy_seed)
 
     store = StateStore(STATE_FILE)
@@ -256,15 +292,19 @@ def run_paper(config: dict) -> None:
     # Fetched once here (rather than left to engine.run_once) so the same
     # day_prices can also mark-to-market the buy_and_hold sleeve below,
     # without a second round of API calls per symbol.
-    windows = {}
-    for symbol in config["watchlist"]:
+    engine_symbols = dynamic_symbols(config, broker, strategy_seed) if dynamic else config["watchlist"]
+    # the virtual buy&hold benchmark always prices the FIXED list, so fetch it too (once per symbol)
+    to_fetch = list(dict.fromkeys([*engine_symbols, *(config["watchlist"] if bh_seed > 0 else [])]))
+    bars = {}
+    for symbol in to_fetch:
         try:
-            windows[symbol] = data_feed.get_ohlcv(
+            bars[symbol] = data_feed.get_ohlcv(
                 symbol, config["data_feed"]["interval"], config["data_feed"]["lookback_days"]
             )
         except Exception as exc:
             logger.warning("skipping %s: failed to fetch data (%s)", symbol, exc)
-    day_prices = {symbol: float(df["close"].iloc[-1]) for symbol, df in windows.items()}
+    windows = {symbol: bars[symbol] for symbol in engine_symbols if symbol in bars}
+    day_prices = {symbol: float(df["close"].iloc[-1]) for symbol, df in bars.items()}
 
     bh_sleeve = None
     if bh_seed > 0:

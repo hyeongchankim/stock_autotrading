@@ -141,6 +141,14 @@ discovery:
   # 청산은 스윙형 - 기존 risk.stop_loss_pct/take_profit_pct/daily_max_loss_pct 그대로 재사용,
   # 별도 손절/익절 값 없음 (main.py의 run_discovery 참고)
 
+dynamic_watchlist:
+  enabled: true      # true면 워치리스트 슬리브가 고정 10종목 대신 발굴형과 같은 시장 스캔에서 그때그때 후보를 골라 거래
+                      # (고정 `watchlist`는 가상 매수후보유(hybrid)와 MACD 슬리브용으로 그대로 남음). 2026-10-06 추가.
+  max_candidates: 10  # 등락률 상위 몇 종목까지 평가할지 (보유 종목은 별도로 항상 평가 - 청산 점검 유지)
+  max_price: null     # 1주 가격 상한. null이면 전략 슬리브 시드 x risk.position_size_pct (그보다 비싼 종목은 어차피 0주라 제외)
+                      # 후보 필터(가격/등락률/거래대금)는 `discovery` 섹션 값을 그대로 씀. whale_flow는 동적 모드에서 KRX 호출
+                      # 폭증(차단 위험) 때문에 투자자 데이터를 받지 않음
+
 macd_sleeve:
   enabled: true   # MACD 골든/데드크로스 단독, 위 watchlist 고정 10종목에 그대로 적용하되 완전히
                    # 별도 시드로 운용하는 세 번째 슬리브. regime_filter/volume_filter 둘 다 의도적으로
