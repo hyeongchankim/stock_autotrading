@@ -20,8 +20,9 @@
   하루 차단한 사건, "핵심 여정" 26번). **27번 이후 KRX를 쓰는 곳은 `whale_flow`뿐**(발굴형은 유니버스 캐시로 KRX
   불필요) - whale_flow가 꺼져 있는 동안엔 스케줄러 5개 모두 KRX 없이 재활성화 가능. 재활성화 절차는 "다음에 이어서 할 만한 것" 1번. (참고:
   Paper/Macd는 10/1 13:50~14:20에도 오염 수정 때문에 잠시 Disabled였음 - 23번):
-  - `StockAutoTradingPaper`: 고정 10종목 워치리스트(whale_flow+rsi+변동성돌파+close_strength),
-    평일 09:00~15:30 15분 간격, `run_paper_cycle.bat` → `python main.py --mode paper`
+  - `StockAutoTradingPaper`: 워치리스트 슬리브 - **2026-10-06부터 종목이 동적**(핵심 여정 28번: 발굴형과 같은 시장
+    스캔의 상위 등락 종목 중 살 수 있는 가격대 + 보유 종목; 고정 10종목은 가상 매수후보유·MACD 슬리브용으로만 남음)
+    (whale_flow+rsi+변동성돌파+close_strength), 평일 09:00~15:30 15분 간격, `run_paper_cycle.bat` → `python main.py --mode paper`
     (시드는 `config.yaml`의 `seed_capital` 100만원, `state.json`)
   - `StockDiscoveryScan1`(11:00)/`StockDiscoveryScan2`(13:30)/`StockDiscoveryFinal`(15:20):
     코스피200+코스닥150 매일 스캔형("발굴형 종가매매"), `run_discovery_cycle.bat scan|final` →
@@ -417,6 +418,35 @@
       옮겨 만든 것** - 신규 상장 몇 종목(원래 351종목)은 갱신(10/9 이후, KRX 가능할 때)까지 빠질 수 있음.
       **결과: 캐시가 유효한 동안(기본 7일) 발굴형 전 경로가 KRX 없이 돎**(KIS 스캔·일봉·주문만; 만료 후 갱신 때만 KRX 로그인 1회+조회 몇 건) - 11:00 `scan`을 차단 중에도 KRX 로그 0건으로 실행 확인
 
+28. **2026-10-06: 워치리스트 슬리브를 동적 종목으로 전환 + 포지션 조회 캐시**
+    - **요청/결정**: 사용자가 "고정 10종목 대신 발굴형에서 확인된 종목이나 HTS 검색식으로 찾은 종목을 사는 것처럼
+      최적의 종목을 검색해서" 하고 싶다고 함. 확인 결과 ① KIS에 HTS 조건검색 API가 있음(`psearch-title`
+      `HHKST03900300`로 저장된 검색식 목록, `psearch-result` `HHKST03900400`로 실행 결과; **HTS 아이디 필요, HTS(eFriend
+      Plus [0110])에서 만들고 "사용자조건 서버저장"해야 함, 결과 최대 100건, 푸시 없이 폴링만, 모의투자 지원 여부는 미확인**
+      - 공식 예제 저장소에서 못 찾았고 실제 호출로만 알 수 있음) ② 지금까지 어떤 종목 검색 규칙도 무작위를 못 이겼음
+      (26번) → "최적"을 보장 못 함, 바꾸는 이유는 고정 10종목의 선택 편향 제거와 그날 움직이는 종목 거래라는 구조적
+      이점. 사용자 선택: **소스 A(발굴형과 같은 후보)만, 기존 슬리브를 동적으로 전환, HTS 검색식은 아직 없음(이번엔 안 함)**
+    - **구현** (`screening/dynamic_watchlist.py`, `main.dynamic_symbols`, commit `77304d1`): `dynamic_watchlist.enabled: true`면
+      `run_paper`가 매 사이클 발굴형과 같은 KIS 등락률 스캔 + 1차 필터(가격/등락률/거래대금)로 후보를 뽑고 **1주 가격이
+      포지션 예산(전략 시드 x position_size_pct = 50만 x 30% = 15만원) 이하인 것만** 등락률 순으로 최대 10개
+      (`max_candidates`) + **현재 보유 종목**(스캔에서 빠져도 손절/전략 청산 점검 유지)을 평가. 스캔·유니버스 실패,
+      KIS 브로커 아님 -> **보유 종목만 평가(신규 진입 없음, 청산은 계속)**, 크래시 안 함. 고정 `watchlist`는 가상 매수후보유
+      (벤치마크 가격)와 MACD 슬리브용으로 그대로. **동적 모드에선 whale_flow가 KRX 투자자 데이터를 안 받음**(경고 로그) -
+      후보가 매 사이클 바뀌면 KRX 호출이 폭증해 차단 위험(26번)이라서. 설정: `config.yaml`의 `dynamic_watchlist`
+      (`max_candidates`, `max_price`(null이면 예산 규칙)). 테스트 9개 추가
+    - **실데이터 검증**: 10/6 09:17 읽기 전용 확인 - 스캔 30건 -> 1차 필터 9건 -> 가격 상한 15만원으로 **4종목만 남음**(브이엠 6.7만,
+      대우건설 1.8만, 성호전자 3.2만, 제주반도체 9.2만; 주성엔지니어링 26만·심텍 17만·삼성전기/SK스퀘어/SK하이닉스 100만원대는 제외).
+      09:20 실사이클 1회: 종료코드 0, 4종목 평가, 신호 없어 주문 없음, 가상 보유 평가 정상, **약 10초 만에 끝남**
+    - **포지션 조회 캐시** (`KisBroker.get_positions`, commit `6d849ae`): 엔진이 종목마다 포지션을 여러 번 읽어 KIS `inquire-balance`가
+      사이클당 수십 번이었고 이게 모의서버 "failed after 3 attempts" 크래시(10/5에도 15:30 Paper 1건)의 주원인이라, 20초
+      캐시(주문이 접수되면 즉시 폐기, `restore_ledger`도 폐기, 체결 확인은 캐시를 안 거치고 계좌를 직접 읽음). 동적 목록이 종목을
+      더 읽는 만큼 필요했음. 테스트 4개 추가(전체 176개 통과)
+    - **알려진 한계 (솔직히)**: ① 후보 풀이 작음 - KIS 스캔이 첫 페이지 ~30건만 주고(페이지네이션 미구현) 가격 상한 15만원이
+      대형주를 대부분 제거해서 하루 후보가 0~몇 개일 수 있음(시드 50만원 때문). 스캔 결과엔 등락률 마이너스 종목도 섞여 있어
+      "상승 종목"만이 아님. ② 발굴형과 같은 종목 풀을 다른 전략·시드로 거래하므로 같은 종목을 둘 다 살 수 있음(장부는 분리돼 있어
+      문제는 없음). ③ 이 동적 슬리브가 고정 10종목보다 낫다는 **증거는 없음** - 포워드로 지켜봐야 함. ④ close_strength는 15분마다
+      "오늘 진행 중인 봉"으로 판단(기존과 동일)
+
 ## 참고 자료 (발굴형 종가매매 설계 시 조사한 GitHub 프로젝트)
 
 - [KTHYEONG/k-closing-alpha](https://github.com/KTHYEONG/k-closing-alpha) - 정확히 같은 컨셉
@@ -465,6 +495,8 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
   슬리브 중 가장 빠르게, 가장 명확하게 "자연 신호→실주문"이 실증된 사례
 
 ❌ 아직 안 됨:
+- **동적 워치리스트 슬리브(28번)는 실사이클 1회 + 유닛테스트만 검증** - 자연 신호로 진입/청산한 사례 없음, 후보 풀이 작음(하루 0~몇 종목).
+  HTS 검색식 연동(소스 B)은 안 함(HTS 검색식·HTS 아이디 없음, 모의투자 지원 미확인), 자체 검색식(소스 C)도 안 함
 - **스케줄러 5개 전부 Disabled / KRX IP 차단 중 / whale_flow 임시 비활성** (26번) - 복구 안 하면 자동매매가 안 돎.
   스케줄러 재활성화는 KRX 없이 가능(27번), whale_flow 복구만 차단 해제 후("다음에 이어서" 0번)
 - **포워드 테스트(27번)는 데이터가 0건** - 발굴형 Final(15:20)이 돌아야 쌓이고 몇 주 모여야 `python -m screening.forward_report`가
@@ -499,8 +531,8 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
 
 - 코드 변경은 전부 커밋·푸시 완료. MACD 슬리브는 `7fbdfd4`, 포지션 격리 수정은 `1682a8a`,
   토큰 발급 충돌 수정은 `45a96fc`, 테스트가 운영 로그에 쓰던 문제 수정은 `e60ab3b`.
-  **10/2 커밋은 아직 푸시 안 됨**: 백테스트 연구 `40782e9`, whale_flow 임시 비활성 `77e58b9`, 야간 청산 백테스트
-  `a92dbc7`, 포워드 테스트 로그 `97c1f14`, 유니버스 캐시 `6542bb9` (테스트 163개 통과). 로컬 전용 파일(gitignore):
+  10/2 커밋(백테스트 연구 `40782e9`, whale_flow 임시 비활성 `77e58b9`, 야간 청산 `a92dbc7`, 포워드 로그 `97c1f14`, 유니버스
+  캐시 `6542bb9`)은 푸시 완료. **10/6 커밋은 아직 푸시 안 됨**: 포지션 조회 캐시 `6d849ae`, 동적 워치리스트 `77304d1` (테스트 176개 통과). 로컬 전용 파일(gitignore):
   `forward_log.json`, `universe_cache.json`, `.bt_cache/`. 로컬에만 있는 untracked 파일: `state.json.bak-20261001`,
   `macd_state.json.bak-20261001`(23번의 보정 전 백업).
   - `state.json`/`discovery_state.json`/`screening_state.json`/`macd_state.json`과 스케줄러
@@ -523,6 +555,9 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID                 - 알림용 (선택 기능
    `python -c "import pykrx"`가 "KRX 로그인 완료"만 찍고 끝나는지(차단 중이면 `JSONDecodeError`) - **확인은 한 번만,
    반복 호출 금지** ② `whale_flow.enabled: true` 복구 ③ 첫 사이클 로그에서 `skipping whale flow enrichment`가
    사라졌는지 확인. 안 풀리거나 재적용되면 KRX 호출을 늘리지 말고 `whale_flow`를 끈 채로 운영
+1a. **동적 워치리스트 슬리브 관찰** (10/6~) - 로그의 `dynamic watchlist: N movers ... + M held`로 하루 후보 수 확인, 후보가 계속 0~1개면
+   `dynamic_watchlist.max_price`/`max_candidates`나 시드 조정 검토, 실제 진입이 나오는지 확인.
+   whale_flow 복구 시(0번 b) 동적 슬리브는 KRX 투자자 데이터를 안 받는다는 점 유의(MACD 슬리브는 고정 목록이라 계속 받음)
 1. **격리·토큰 수정 관찰 계속** (10/2 09:00~) - Paper/Macd는 같은 시각에 돎. 10/1은 마감까지
    격리가 유지됐음(25번). `state.json`/`macd_state.json`의 `positions`와 현금이 서로 안 섞이는지,
    워치리스트 로그에 "refusing to sell another sleeve's shares"가 뜨는 경우(= 격리가 실제로 막은
