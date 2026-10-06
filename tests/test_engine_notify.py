@@ -159,5 +159,20 @@ class TestEngineEntryExitNotifications(unittest.TestCase):
         mock_notify.assert_not_called()
 
 
+
+class TestUnaffordableEntryIsLogged(unittest.TestCase):
+    def test_signal_on_a_stock_the_budget_cannot_buy_is_skipped_with_a_reason(self):
+        broker = MockBroker(seed_capital=500_000)
+        risk = RiskManager(seed_capital=500_000, position_size_pct=0.30)  # budget 150k per position
+        engine = TradingEngine(
+            broker=broker, data_feed=None, strategies=[_AlwaysBuyStrategy()], risk_manager=risk,
+            watchlist=[], notify=False,
+        )
+        windows = {"BIG": _make_ohlcv(close=1_800_000.0), "OK": _make_ohlcv(close=100_000.0)}
+        with self.assertLogs("engine", level="INFO") as logs:
+            engine.run_once(precomputed_windows=windows)
+        self.assertEqual(set(broker.get_positions()), {"OK"})  # BIG could not be bought: 0 shares
+        self.assertTrue(any("BIG: entry skipped" in line and "exceeds the position budget" in line for line in logs.output))
+
 if __name__ == "__main__":
     unittest.main()

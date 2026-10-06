@@ -262,6 +262,11 @@ class TradingEngine:
         total_equity = self.broker.get_total_equity()
         quantity = self.risk_manager.calc_position_size(total_equity, candidate.price)
         if quantity <= 0:
+            logger.info(
+                "%s: entry skipped (%s) - one share at %.0f exceeds the position budget %.0f (equity x %.0f%%)",
+                candidate.symbol, candidate.strategy_names, candidate.price,
+                total_equity * self.risk_manager.position_size_pct, self.risk_manager.position_size_pct * 100,
+            )
             return
 
         result = self.broker.place_order(candidate.symbol, Signal.BUY, quantity, candidate.price)

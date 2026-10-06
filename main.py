@@ -246,7 +246,11 @@ def dynamic_symbols(config: dict, broker: BrokerBase, strategy_seed: float) -> l
         return held
 
     disc_cfg, dyn_cfg = config["discovery"], config["dynamic_watchlist"]
-    max_price = dyn_cfg.get("max_price") or strategy_seed * config["risk"]["position_size_pct"]
+    max_price = dyn_cfg.get("max_price")
+    if max_price is None:  # default: only what one position's budget can buy (>= 1 share)
+        max_price = strategy_seed * config["risk"]["position_size_pct"]
+    elif max_price == 0:  # 0 = no cap: high-priced stocks are evaluated even if the sleeve can't afford a share
+        max_price = float("inf")
     try:
         universe = get_universe(max_age_days=disc_cfg.get("universe_cache_days", 7))
         movers = current_movers(session, universe, disc_cfg, dyn_cfg["max_candidates"], max_price)
@@ -255,9 +259,10 @@ def dynamic_symbols(config: dict, broker: BrokerBase, strategy_seed: float) -> l
         return held
 
     symbols = merge_with_held(movers, held)
+    cap = "no price cap" if max_price == float("inf") else f"<= {max_price:.0f} KRW/share"
     logger.info(
-        "dynamic watchlist: %d movers (<= %.0f KRW/share) + %d held: %s",
-        len(movers), max_price, len(symbols) - len(movers), ", ".join(symbols),
+        "dynamic watchlist: %d movers (%s) + %d held: %s",
+        len(movers), cap, len(symbols) - len(movers), ", ".join(symbols),
     )
     return symbols
 

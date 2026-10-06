@@ -145,7 +145,9 @@ dynamic_watchlist:
   enabled: true      # true면 워치리스트 슬리브가 고정 10종목 대신 발굴형과 같은 시장 스캔에서 그때그때 후보를 골라 거래
                       # (고정 `watchlist`는 가상 매수후보유(hybrid)와 MACD 슬리브용으로 그대로 남음). 2026-10-06 추가.
   max_candidates: 10  # 등락률 상위 몇 종목까지 평가할지 (보유 종목은 별도로 항상 평가 - 청산 점검 유지)
-  max_price: null     # 1주 가격 상한. null이면 전략 슬리브 시드 x risk.position_size_pct (그보다 비싼 종목은 어차피 0주라 제외)
+  max_price: 0        # 1주 가격 상한. 0 = 상한 없음(2026-10-06 사용자 요청: 대형주도 평가). null = 전략 슬리브 시드 x risk.position_size_pct 이하만.
+                      # ⚠️ 상한이 없어도 1주가 그 예산(50만 x 30% = 15만원)보다 비싼 종목은 수량이 0주라 신호가 나도 매수되지 않음 -
+                      # 로그에 "entry skipped ... exceeds the position budget"로 남음. 실제로 사려면 시드/비중을 키워야 함
                       # 후보 필터(가격/등락률/거래대금)는 `discovery` 섹션 값을 그대로 씀. whale_flow는 동적 모드에서 KRX 호출
                       # 폭증(차단 위험) 때문에 투자자 데이터를 받지 않음
 

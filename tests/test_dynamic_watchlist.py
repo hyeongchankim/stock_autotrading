@@ -80,6 +80,16 @@ class TestDynamicSymbols(unittest.TestCase):
             app.dynamic_symbols(cfg, _Broker([]), strategy_seed=500_000.0)
         self.assertEqual(movers.call_args.args[4], 90_000)
 
+    def test_zero_max_price_means_no_cap(self):
+        cfg = {**CFG, "dynamic_watchlist": {"enabled": True, "max_candidates": 5, "max_price": 0}}
+        with patch.object(app, "get_universe", return_value={}),              patch.object(app, "current_movers", return_value=[]) as movers:
+            app.dynamic_symbols(cfg, _Broker([]), strategy_seed=500_000.0)
+        self.assertEqual(movers.call_args.args[4], float("inf"))
+
+    def test_no_cap_keeps_expensive_stocks(self):
+        # with an infinite cap pick_symbols no longer drops the 1.8M-won stock (it still ranks by change)
+        self.assertEqual(dw.pick_symbols(_candidates(), 10, float("inf")), ["C.KS", "B.KQ", "D.KS", "A.KS", "E.KQ"])
+
     def test_scan_failure_degrades_to_held_only(self):
         with patch.object(app, "get_universe", return_value={}), \
              patch.object(app, "current_movers", side_effect=RuntimeError("KIS down")):
