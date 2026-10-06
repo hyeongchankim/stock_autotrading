@@ -8,6 +8,7 @@ Run with: pytest
 from __future__ import annotations
 
 import unittest
+from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
 from broker.kis_auth import KisCredentialsError, KisSession
@@ -400,7 +401,7 @@ class TestKisBrokerCashLedger(unittest.TestCase):
         self.assertEqual(self.broker.get_cash_balance(), 500_000.0)
 
     def test_ledger_to_dict_restore_round_trip(self):
-        snapshot = {"cash": 123456.0, "positions": {"005930.KS": {"quantity": 3, "avg_price": 70000.0}}}
+        snapshot = {"cash": 123456.0, "positions": {"005930.KS": {"quantity": 3, "avg_price": 70000.0}}, "pending_orders": []}
         self.broker.restore_ledger(snapshot)
         self.assertEqual(self.broker.get_cash_balance(), 123456.0)
         self.assertEqual(self.broker.ledger_to_dict(), snapshot)
@@ -813,6 +814,101 @@ class TestPositionsCache(unittest.TestCase):
         self.broker.restore_ledger({"cash": 1.0, "positions": {}})
         self.assertEqual(self.broker.get_positions(), {})  # scoped view re-read, ledger now owns nothing
         self.assertEqual(mock_get.call_count, 2)
+
+
+
+class TestPendingOrderReconciliation(unittest.TestCase):
+    """An order KIS accepted but place_order saw as unfilled can fill minutes later (2026-10-06: a
+    31-share MACD BUY did, and the shares ended up owned by no sleeve). It is tracked and booked later."""
+
+    def setUp(self):
+        self.env_patcher = _env_patch()
+        self.env_patcher.start()
+        self.token_patcher = patch("broker.kis_auth.KisSession.get_access_token", return_value="fake-token")
+        self.token_patcher.start()
+        self.broker = KisBroker(env="demo", watchlist=["005930.KS"], seed_capital=1_000_000.0)
+
+    def tearDown(self):
+        self.token_patcher.stop()
+        self.env_patcher.stop()
+
+    @staticmethod
+    def _account(qty):
+        rows = [{"pdno": "005930", "hldg_qty": str(qty), "pchs_avg_pric": "1"}] if qty else []
+        return MagicMock(status_code=200, json=lambda: {"rt_cd": "0", "output1": rows, "output2": [{"dnca_tot_amt": "0"}]})
+
+    def _unfilled_buy(self, mock_get, mock_post, qty=10, price=1000.0):
+        mock_get.return_value = self._account(0)  # the account never shows the shares while we poll
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "0000001548"}})
+        with patch("broker.kis_broker.time.sleep"):
+            return self.broker.place_order("005930.KS", Signal.BUY, qty, price)
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_unfilled_buy_is_tracked_not_booked(self, mock_get, mock_post):
+        result = self._unfilled_buy(mock_get, mock_post)
+        self.assertFalse(result.filled)
+        self.assertEqual(self.broker.get_cash_balance(), 1_000_000.0)  # nothing debited yet
+        pending = self.broker.ledger_to_dict()["pending_orders"]
+        self.assertEqual([(o["order_no"], o["side"], o["quantity"], o["applied_qty"]) for o in pending],
+                         [("0000001548", "BUY", 10, 0)])
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_late_fill_is_booked_once_into_cash_and_positions(self, mock_get, mock_post):
+        self._unfilled_buy(mock_get, mock_post)
+        late = [OrderFill("0000001548", "005930.KS", 10, 10, 0, 990.0)]
+        with patch.object(self.broker, "get_daily_fills", return_value=late):
+            self.assertEqual(self.broker.reconcile_pending(), 10)
+            self.assertEqual(self.broker.reconcile_pending(), 0)  # nothing left, nothing double-counted
+        own = self.broker.ledger_to_dict()["positions"]["005930.KS"]
+        self.assertEqual((own["quantity"], own["avg_price"]), (10, 990.0))
+        self.assertAlmostEqual(self.broker.get_cash_balance(), 1_000_000.0 - 10 * 990.0)
+        self.assertEqual(self.broker.ledger_to_dict()["pending_orders"], [])
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_partial_then_rest_is_booked_incrementally(self, mock_get, mock_post):
+        self._unfilled_buy(mock_get, mock_post, qty=10)
+        with patch.object(self.broker, "get_daily_fills", return_value=[OrderFill("0000001548", "005930.KS", 10, 4, 6, 1000.0)]):
+            self.assertEqual(self.broker.reconcile_pending(), 4)
+        self.assertEqual(len(self.broker.ledger_to_dict()["pending_orders"]), 1)  # 6 still working
+        with patch.object(self.broker, "get_daily_fills", return_value=[OrderFill("0000001548", "005930.KS", 10, 10, 0, 1000.0)]):
+            self.assertEqual(self.broker.reconcile_pending(), 6)  # only the new 6, not 10 again
+        self.assertEqual(self.broker.ledger_to_dict()["positions"]["005930.KS"]["quantity"], 10)
+        self.assertEqual(self.broker.ledger_to_dict()["pending_orders"], [])
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_no_second_buy_while_one_is_still_pending(self, mock_get, mock_post):
+        self._unfilled_buy(mock_get, mock_post)
+        posts_before = mock_post.call_count
+        result = self.broker.place_order("005930.KS", Signal.BUY, 10, 1000.0)
+        self.assertFalse(result.filled)
+        self.assertIn("still pending", result.message)
+        self.assertEqual(mock_post.call_count, posts_before)  # nothing sent to KIS
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_expired_order_is_dropped_and_lookup_failure_keeps_it(self, mock_get, mock_post):
+        self._unfilled_buy(mock_get, mock_post)
+        tomorrow = date.today() + timedelta(days=1)
+        with patch.object(self.broker, "get_daily_fills", side_effect=RuntimeError("KIS down")):
+            self.assertEqual(self.broker.reconcile_pending(today=tomorrow), 0)
+        self.assertEqual(len(self.broker.ledger_to_dict()["pending_orders"]), 1)  # failure: retry next run
+        with patch.object(self.broker, "get_daily_fills", return_value=[]):
+            self.broker.reconcile_pending(today=tomorrow)  # a day later and never filled: it lapsed
+        self.assertEqual(self.broker.ledger_to_dict()["pending_orders"], [])
+        self.assertEqual(self.broker.get_cash_balance(), 1_000_000.0)
+
+    def test_pending_orders_survive_a_save_and_restore(self):
+        self.broker._pending = [{"order_no": "1", "symbol": "005930.KS", "side": "BUY", "quantity": 3, "price": 1.0,
+                                 "date": date.today().isoformat(), "applied_qty": 0}]
+        snapshot = self.broker.ledger_to_dict()
+        fresh = KisBroker(env="demo", watchlist=["005930.KS"], seed_capital=1_000_000.0)
+        fresh.restore_ledger(snapshot)
+        self.assertEqual(fresh.ledger_to_dict()["pending_orders"], snapshot["pending_orders"])
+
 
 if __name__ == "__main__":
     unittest.main()

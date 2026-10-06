@@ -268,6 +268,17 @@ def dynamic_symbols(config: dict, broker: BrokerBase, strategy_seed: float) -> l
     return symbols
 
 
+def reconcile_orders(broker) -> None:
+    """Book the late fills of orders that looked unfilled last run (KisBroker only), before the
+    engine reads positions. Best-effort: a failure here must never stop the cycle."""
+    if not isinstance(broker, KisBroker):
+        return
+    try:
+        broker.reconcile_pending()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("pending-order reconciliation skipped (%s)", exc)
+
+
 def market_closed(config: dict) -> bool:
     """True when KIS positively shows today is not a trading day (a holiday the weekday-only
     scheduler doesn't know about) - the run then does nothing instead of trading on stale bars."""
@@ -301,6 +312,7 @@ def run_paper(config: dict) -> None:
     engine.risk_manager.restore(state.get("risk_manager", {}))
     if isinstance(broker, KisBroker):
         broker.restore_ledger(state.get("kis_cash_ledger", {}))
+    reconcile_orders(broker)
     # roll_to_day here (redundant but harmless - run_once() does it again)
     # so was_halted_today below reflects *today's* state, not a stale halt
     # carried over from a previous day's restore().
@@ -404,6 +416,7 @@ def run_macd_sleeve(config: dict) -> None:
     engine.risk_manager.restore(state.get("risk_manager", {}))
     if isinstance(broker, KisBroker):
         broker.restore_ledger(state.get("kis_cash_ledger", {}))
+    reconcile_orders(broker)
     engine.risk_manager.roll_to_day(date.today())
     was_halted_today = engine.risk_manager.trading_halted_today
 
@@ -516,6 +529,7 @@ def run_discovery(config: dict, checkpoint: str) -> None:
     state = store.load()
     risk_manager.restore(state.get("risk_manager", {}))
     broker.restore_ledger(state.get("kis_cash_ledger", {}))
+    reconcile_orders(broker)
     risk_manager.roll_to_day(date.today())
 
     held = set(broker.get_positions().keys())

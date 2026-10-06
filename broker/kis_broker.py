@@ -130,6 +130,10 @@ class KisBroker(BrokerBase):
         self.commission_pct = commission_pct
         self.sell_tax_pct = sell_tax_pct
         self._positions_cache: tuple[float, dict] | None = None
+        # Orders KIS accepted that had not (fully) filled when place_order returned. A limit order can fill
+        # minutes later (2026-10-06 09:00: a 31-share BUY the MACD sleeve thought had failed filled afterwards and
+        # sat in the account owned by no sleeve). Tracked here, booked by reconcile_pending() on the next run.
+        self._pending: list[dict] = []
 
     def ledger_to_dict(self) -> dict:
         """Snapshot for StateStore, so the local cash/position ledger
@@ -138,13 +142,14 @@ class KisBroker(BrokerBase):
         """
         if self._cash_ledger is None:
             return {}
-        return {"cash": self._cash_ledger, "positions": self._owned}
+        return {"cash": self._cash_ledger, "positions": self._owned, "pending_orders": self._pending}
 
     def restore_ledger(self, state: dict) -> None:
         if self._cash_ledger is None or not state:
             return
         self._positions_cache = None
         self._cash_ledger = state.get("cash", self._cash_ledger)
+        self._pending = [dict(o) for o in state.get("pending_orders", [])]
         if "positions" in state:
             self._owned = {s: dict(p) for s, p in state["positions"].items()}
         else:
@@ -421,6 +426,11 @@ class KisBroker(BrokerBase):
                     "this sleeve holds no position in the symbol - refusing to sell another sleeve's shares",
                 )
             quantity = min(quantity, pre_position.quantity)
+        if side == Signal.BUY and any(o["symbol"] == symbol and o["side"] == "BUY" for o in self._pending):
+            return OrderResult(
+                symbol, side, quantity, fill_price, False,
+                "a BUY order for this symbol is still pending - not sending a second one",
+            )
 
         if self.session.env == "real":
             logger.warning(
@@ -461,28 +471,84 @@ class KisBroker(BrokerBase):
             realized_pnl = (self._effective_price(side, fill_price) - pre_position.avg_price) * actual_qty
 
         if actual_qty <= 0:
+            self._track_pending(order_no, symbol, side, quantity, fill_price, applied_qty=0)
             return OrderResult(
                 symbol, side, 0, fill_price, False,
                 f"order accepted but not filled yet (order_no={order_no}) - "
-                "may still fill later, check get_daily_fills()",
+                "tracked as pending, booked by reconcile_pending() once KIS reports the fill",
             )
 
+        self._book(side, symbol, actual_qty, fill_price)
+        if actual_qty < quantity:  # partly filled: the rest may still fill later
+            self._track_pending(order_no, symbol, side, quantity, fill_price, applied_qty=actual_qty)
+
+        return OrderResult(symbol, side, actual_qty, fill_price, True, f"filled (order_no={order_no})", realized_pnl)
+
+    def _book(self, side: Signal, symbol: str, qty: int, price: float) -> None:
+        """Books a fill into this sleeve's cash ledger and position ledger."""
         if self._cash_ledger is not None:
-            effective_price = self._effective_price(side, fill_price)
+            effective_price = self._effective_price(side, price)
             if side == Signal.BUY:
-                self._cash_ledger -= actual_qty * effective_price
+                self._cash_ledger -= qty * effective_price
             else:
-                self._cash_ledger += actual_qty * effective_price
+                self._cash_ledger += qty * effective_price
 
         if self._owned is not None:
             own = self._owned.get(symbol, {"quantity": 0, "avg_price": 0.0})
             if side == Signal.BUY:
-                qty = own["quantity"] + actual_qty
-                avg = (own["quantity"] * own["avg_price"] + actual_qty * fill_price) / qty
-                self._owned[symbol] = {"quantity": qty, "avg_price": avg}
-            elif own["quantity"] - actual_qty > 0:
-                self._owned[symbol] = {"quantity": own["quantity"] - actual_qty, "avg_price": own["avg_price"]}
+                total = own["quantity"] + qty
+                avg = (own["quantity"] * own["avg_price"] + qty * price) / total
+                self._owned[symbol] = {"quantity": total, "avg_price": avg}
+            elif own["quantity"] - qty > 0:
+                self._owned[symbol] = {"quantity": own["quantity"] - qty, "avg_price": own["avg_price"]}
             else:
                 self._owned.pop(symbol, None)
 
-        return OrderResult(symbol, side, actual_qty, fill_price, True, f"filled (order_no={order_no})", realized_pnl)
+    def _track_pending(self, order_no: str, symbol: str, side: Signal, quantity: int, price: float, applied_qty: int) -> None:
+        if self._cash_ledger is None or not order_no:  # unscoped broker keeps no ledger to reconcile into
+            return
+        self._pending.append({
+            "order_no": order_no, "symbol": symbol, "side": side.value, "quantity": quantity, "price": price,
+            "date": date.today().isoformat(), "applied_qty": applied_qty,
+        })
+
+    def reconcile_pending(self, today: date | None = None) -> int:
+        """Books the late fills of orders place_order saw as unfilled/partly filled, from KIS's own
+        order-fill query (get_daily_fills). Run at the start of every run, before the engine reads
+        positions. Orders are day orders: once their day has passed they are dropped (anything that did
+        fill has been booked by then). A lookup failure keeps the order for the next run. Never raises.
+        Returns the number of shares booked.
+        """
+        if not self._pending or self._cash_ledger is None:
+            return 0
+        today = today or date.today()
+        booked, keep = 0, []
+        for order in self._pending:
+            order_day = date.fromisoformat(order["date"])
+            try:
+                fills = [f for f in self.get_daily_fills(order["order_no"], as_of=order_day) if f.order_no == order["order_no"]]
+            except Exception as exc:  # noqa: BLE001 - retry next run, never break the cycle
+                logger.warning("pending order %s: fill lookup failed (%s) - will retry", order["order_no"], exc)
+                keep.append(order)
+                continue
+            fill = fills[0] if fills else None
+            if fill is not None and fill.filled_qty > order["applied_qty"]:
+                late = fill.filled_qty - order["applied_qty"]
+                self._book(Signal(order["side"]), order["symbol"], late, fill.avg_fill_price or order["price"])
+                order["applied_qty"] = fill.filled_qty
+                booked += late
+                logger.info("pending order %s: booked a late fill %s %s x%d", order["order_no"], order["side"], order["symbol"], late)
+            done = fill is not None and (order["applied_qty"] >= order["quantity"] or fill.pending_qty == 0)
+            if done:
+                continue
+            if order_day < today:
+                logger.warning(
+                    "pending order %s (%s %s) expired with %d of %d filled", order["order_no"], order["side"],
+                    order["symbol"], order["applied_qty"], order["quantity"],
+                )
+                continue
+            keep.append(order)
+        self._pending = keep
+        if booked:
+            self._positions_cache = None
+        return booked
