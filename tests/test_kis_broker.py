@@ -910,5 +910,69 @@ class TestPendingOrderReconciliation(unittest.TestCase):
         self.assertEqual(fresh.ledger_to_dict()["pending_orders"], snapshot["pending_orders"])
 
 
+
+class TestSleeveCashIsEnforced(unittest.TestCase):
+    """A scoped (seed_capital) broker refuses a BUY its ledger cash can't cover, like MockBroker -
+    sizing is a % of equity, so without this a 4th position pushed a sleeve's cash negative."""
+
+    def setUp(self):
+        self.env_patcher = _env_patch()
+        self.env_patcher.start()
+        self.token_patcher = patch("broker.kis_auth.KisSession.get_access_token", return_value="fake-token")
+        self.token_patcher.start()
+
+    def tearDown(self):
+        self.token_patcher.stop()
+        self.env_patcher.stop()
+
+    @staticmethod
+    def _account(qty=0):
+        rows = [{"pdno": "005930", "hldg_qty": str(qty), "pchs_avg_pric": "1"}] if qty else []
+        return MagicMock(status_code=200, json=lambda: {"rt_cd": "0", "output1": rows, "output2": [{"dnca_tot_amt": "0"}]})
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_a_buy_larger_than_the_cash_is_refused_and_never_sent(self, mock_get, mock_post):
+        broker = KisBroker(env="demo", watchlist=["005930.KS"], seed_capital=1_000_000.0)
+        mock_get.return_value = self._account(0)
+        result = broker.place_order("005930.KS", Signal.BUY, 11, 100_000.0)  # costs 1.1M > 1.0M
+        self.assertFalse(result.filled)
+        self.assertIn("insufficient sleeve cash", result.message)
+        mock_post.assert_not_called()
+        self.assertEqual(broker.get_cash_balance(), 1_000_000.0)
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_a_buy_that_exactly_fits_goes_through(self, mock_get, mock_post):
+        broker = KisBroker(env="demo", watchlist=["005930.KS"], seed_capital=1_000_000.0)
+        mock_get.side_effect = [self._account(0), self._account(10)]
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "1"}})
+        result = broker.place_order("005930.KS", Signal.BUY, 10, 100_000.0)  # exactly 1.0M
+        self.assertTrue(result.filled)
+        self.assertAlmostEqual(broker.get_cash_balance(), 0.0)
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_cash_committed_to_a_working_buy_counts_as_spent(self, mock_get, mock_post):
+        broker = KisBroker(env="demo", watchlist=["005930.KS", "000660.KS"], seed_capital=1_000_000.0)
+        mock_get.return_value = self._account(0)  # first order never shows up in the account while we poll
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "7"}})
+        with patch("broker.kis_broker.time.sleep"):
+            first = broker.place_order("005930.KS", Signal.BUY, 6, 100_000.0)  # 600k working, not yet booked
+            self.assertFalse(first.filled)
+            posts = mock_post.call_count
+            second = broker.place_order("000660.KS", Signal.BUY, 5, 100_000.0)  # 500k: fits 1.0M alone, not with the 600k
+        self.assertFalse(second.filled)
+        self.assertIn("insufficient sleeve cash", second.message)
+        self.assertEqual(mock_post.call_count, posts)
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_an_unscoped_broker_has_no_ledger_to_enforce(self, mock_get, mock_post):
+        broker = KisBroker(env="demo", watchlist=["005930.KS"])  # no seed_capital: account inspection mode
+        mock_get.side_effect = [self._account(0), self._account(1_000)]
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "1"}})
+        self.assertTrue(broker.place_order("005930.KS", Signal.BUY, 1_000, 100_000.0).filled)
+
 if __name__ == "__main__":
     unittest.main()

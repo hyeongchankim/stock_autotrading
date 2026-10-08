@@ -431,6 +431,22 @@ class KisBroker(BrokerBase):
                 symbol, side, quantity, fill_price, False,
                 "a BUY order for this symbol is still pending - not sending a second one",
             )
+        if side == Signal.BUY and self._cash_ledger is not None:
+            # Same rule as MockBroker, which every backtest ran on: a buy the sleeve's cash can't cover is
+            # refused, not sent. Without it a 4th position took the MACD sleeve to -224k cash on 2026-10-07
+            # (sizing is a % of EQUITY and KIS happily filled it from the other sleeves' unused demo cash).
+            # Cash already committed to still-working BUY orders counts as spent.
+            reserved = sum(
+                (o["quantity"] - o["applied_qty"]) * self._effective_price(Signal.BUY, o["price"])
+                for o in self._pending if o["side"] == "BUY"
+            )
+            cost = quantity * self._effective_price(Signal.BUY, fill_price)
+            available = self._cash_ledger - reserved
+            if cost > available:
+                return OrderResult(
+                    symbol, side, quantity, fill_price, False,
+                    f"insufficient sleeve cash (need {cost:,.0f}, available {available:,.0f})",
+                )
 
         if self.session.env == "real":
             logger.warning(
