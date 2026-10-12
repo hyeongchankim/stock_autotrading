@@ -28,8 +28,9 @@ from risk.risk_manager import RiskManager
 from screening.checkpoint_store import persistent_candidates, record_checkpoint
 from data.market_calendar import market_closed_today
 from screening.dynamic_watchlist import current_movers, merge_with_held
-from screening.forward_log import fill_outcomes, record_candidates
+from screening.forward_log import fill_outcomes, record_candidates, record_l1_hits
 from screening.gap_tag import tag_scan
+from screening.l1_universe import scan_l1_hits
 from screening.discover import filter_candidates, get_universe, scan_market
 from strategies.close_strength import CloseStrengthStrategy
 from strategies.mean_reversion import RSIStrategy, VolatilityBreakoutStrategy
@@ -574,6 +575,15 @@ def run_discovery(config: dict, checkpoint: str) -> None:
         "discovery cycle complete. cash=%.0f positions=%s equity=%.0f",
         broker.get_cash_balance(), list(broker.get_positions().keys()), equity,
     )
+
+    # forward test, AFTER all trading so it can never delay an order: evaluate the L1 rule on the whole universe
+    # (screening/l1_universe.py) and log the hits that aren't already top-mover candidates. Best-effort.
+    try:
+        hits, stats = scan_l1_hits(KisDataFeed(env=env), list(universe), date.today())
+        added = record_l1_hits(StateStore(FORWARD_LOG_FILE), date.today(), hits, set(symbols_today))
+        logger.info("forward log: L1 universe scan %s -> logged %d new rows (%s)", stats, added, ", ".join(h["symbol"] for h in hits))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("forward log: L1 universe scan skipped (%s)", exc)
 
 
 def run_backtest(config: dict) -> None:

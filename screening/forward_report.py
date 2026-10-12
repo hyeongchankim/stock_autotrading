@@ -50,6 +50,9 @@ def summarize(df: pd.DataFrame, top_ns: tuple[int, ...] = (3, 5, 10)) -> pd.Data
         if col in df:
             groups[f"L1 {label}"] = df[col].eq(True)
             groups[f"not L1 {label}"] = df[col].eq(False)
+    if "source" in df:
+        groups["L1 @15:20, found by the universe scan"] = df["source"].eq("l1_universe")
+        groups["L1 @15:20, already a top-mover candidate"] = df["scan_l1"].eq(True) & df["source"].ne("l1_universe")
     rows = []
     for label, mask in groups.items():
         sub = df[mask & df["open_next"].notna()]
@@ -83,6 +86,9 @@ def main() -> None:
     print("")
     print("Backtest reference (daily bars, close->open, net): top-5 movers +0.13, live entries +0.11; "
           "next-open -> close -0.20..-0.31")
+    print("L1 backtest (347 names, close->next open, net of cost): +0.34% per trade, win 50.5%, vs the universe's own "
+          "-0.04% (see backtest/gap_breakout.py). The 'not L1' rows are large-cap top movers, a weak control - compare "
+          "L1 rows with the -0.04% universe figure.")
 
 
 if __name__ == "__main__":

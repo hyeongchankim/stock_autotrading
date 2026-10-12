@@ -58,6 +58,29 @@ def record_candidates(
     return len(new)
 
 
+def record_l1_hits(store: StateStore, as_of: date, hits: list[dict], seen: set[str], now: datetime | None = None) -> int:
+    """Logs universe-wide L1 hits (screening/l1_universe.scan_l1_hits rows) as extra rows with source="l1_universe".
+    `seen` = symbols already logged for as_of from the candidate scan - those keep their own row (and scan_tag), so a
+    symbol is never logged twice a day. Re-running the same day replaces only this function's rows. Returns rows added.
+    """
+    now = now or datetime.now()
+    day = as_of.isoformat()
+    new = [
+        {
+            "date": day, "symbol": h["symbol"], "name": h["symbol"], "rank": None, "price_scan": float(h["price"]),
+            "change_pct": float(h["change_pct"]), "volume": int(h["volume"]), "trading_value": float(h["trading_value"]),
+            "qualified": False, "source": "l1_universe", "scanned_at": now.isoformat(timespec="seconds"),
+            "scan_tag": h["features"],
+        }
+        for h in hits if h["symbol"] not in seen
+    ]
+    state = store.load()
+    kept = [r for r in state.get("records", []) if not (r["date"] == day and r.get("source") == "l1_universe")]
+    state["records"] = kept + new
+    store.save(state)
+    return len(new)
+
+
 def _pending(records: list[dict]) -> list[dict]:
     return [r for r in records if any(f not in r for f in _OUTCOME_FIELDS)]
 
