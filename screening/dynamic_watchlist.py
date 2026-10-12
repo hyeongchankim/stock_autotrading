@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from screening.discover import filter_candidates, scan_market
+from screening.universe_quotes import universe_candidates
 
 
 def pick_symbols(candidates: pd.DataFrame, max_candidates: int, max_price: float) -> list[str]:
@@ -28,7 +28,6 @@ def merge_with_held(movers: list[str], held) -> list[str]:
 
 
 def current_movers(session, universe: dict, disc_cfg: dict, max_candidates: int, max_price: float) -> list[str]:
-    """One KIS ranking call, filtered exactly like the discovery sleeve's 1차 필터."""
-    scan = scan_market(session, min_price=disc_cfg["min_price"], max_change_pct=disc_cfg["max_change_pct"])
-    candidates = filter_candidates(scan, universe, min_trading_value=disc_cfg["min_trading_value"])
-    return pick_symbols(candidates, max_candidates, max_price)
+    """The universe's live quotes (about a dozen KIS calls), filtered exactly like the discovery sleeve's
+    1차 필터 and ranked by exact change % - the same candidates the 발굴형 sleeve sees."""
+    return pick_symbols(universe_candidates(session, universe, disc_cfg), max_candidates, max_price)

@@ -36,13 +36,14 @@ class TestPickAndMerge(unittest.TestCase):
         self.assertEqual(dw.merge_with_held([], ["X"]), ["X"])
 
     def test_current_movers_applies_the_discovery_filters_then_affordability(self):
-        scan = pd.DataFrame({
+        quotes = pd.DataFrame({
             "ticker": ["000001", "000002", "000003", "000004"], "name": list("abcd"),
             "price": [50_000.0, 60_000.0, 40_000.0, 900_000.0], "change_pct": [8.0, 5.0, 9.0, 11.0],
-            "volume": [100_000, 100_000, 10, 100_000],  # 000003: 40k * 10 = far below 30억
+            "volume": [100_000, 100_000, 10, 100_000], "trading_value": [5e9, 5e9, 4e5, 9e10],  # 000003: far below 30억
+            "open": 0.0, "high": 0.0, "prev_close": 0.0,
         })
-        universe = {"000001.KS": "a", "000002.KQ": "b", "000003.KS": "c", "000004.KS": "d"}  # 000009 etc. not in it
-        with patch.object(dw, "scan_market", return_value=scan):
+        universe = {"000001.KS": "a", "000002.KQ": "b", "000003.KS": "c", "000004.KS": "d"}
+        with patch("screening.universe_quotes.fetch_quotes", return_value=quotes):
             movers = dw.current_movers(object(), universe, DISC, max_candidates=10, max_price=150_000)
         # 000003 illiquid, 000004 unaffordable -> the two left, strongest first
         self.assertEqual(movers, ["000001.KS", "000002.KQ"])

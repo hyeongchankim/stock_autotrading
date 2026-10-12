@@ -31,7 +31,8 @@ from screening.dynamic_watchlist import current_movers, merge_with_held
 from screening.forward_log import fill_outcomes, record_candidates, record_l1_hits
 from screening.gap_tag import tag_scan
 from screening.l1_universe import scan_l1_hits
-from screening.discover import filter_candidates, get_universe, scan_market
+from screening.universe_quotes import universe_candidates
+from screening.discover import get_universe
 from strategies.close_strength import CloseStrengthStrategy
 from strategies.mean_reversion import RSIStrategy, VolatilityBreakoutStrategy
 from strategies.regime import RegimeFilter
@@ -484,15 +485,20 @@ def run_discovery(config: dict, checkpoint: str) -> None:
 
     universe = get_universe(max_age_days=disc_cfg.get("universe_cache_days", 7))
     session = KisSession(env=env)
-    scan = scan_market(session, min_price=disc_cfg["min_price"], max_change_pct=disc_cfg["max_change_pct"])
-    today_candidates = filter_candidates(scan, universe, min_trading_value=disc_cfg["min_trading_value"])
-    symbols_today = today_candidates["symbol"].tolist()
+    # candidates = the universe's own live quotes, ranked by exact change % (screening/universe_quotes.py). The KIS
+    # ranking page this replaced was an unsorted, arbitrary 30 rows (2026-10-12: -10.4%..+1.1%, median -4.0%).
+    today_candidates = universe_candidates(session, universe, disc_cfg)
+    # The 1차 필터 now passes ~260 of the ~350 universe names (the ranking page it replaced passed ~10), so the
+    # "must show up at 2+ checkpoints" persistence rule only means something if each checkpoint records just the
+    # strongest N right now - otherwise every liquid stock qualifies and a last-minute spike is not screened out.
+    shortlist = today_candidates.head(disc_cfg.get("checkpoint_top_n", 10))
+    symbols_today = shortlist["symbol"].tolist()
 
     screening_store = StateStore(SCREENING_STATE_FILE)
     record_checkpoint(screening_store, date.today(), symbols_today)
     logger.info(
-        "discovery %s checkpoint: %d candidates passed 1차 필터 (%s)",
-        checkpoint, len(symbols_today), ", ".join(symbols_today[:10]),
+        "discovery %s checkpoint: top %d of %d candidates passing the 1차 필터 (%s)",
+        checkpoint, len(symbols_today), len(today_candidates), ", ".join(symbols_today),
     )
 
     if checkpoint != "final":
@@ -509,8 +515,8 @@ def run_discovery(config: dict, checkpoint: str) -> None:
     )
     try:
         # L1 tag (screening/gap_tag.py): evaluated now, on the still-open daily bars - the tradable view
-        tags = tag_scan(KisDataFeed(env=env), today_candidates["symbol"].tolist(), date.today())
-        logged = record_candidates(StateStore(FORWARD_LOG_FILE), date.today(), today_candidates, set(qualified), tags=tags)
+        tags = tag_scan(KisDataFeed(env=env), symbols_today, date.today())
+        logged = record_candidates(StateStore(FORWARD_LOG_FILE), date.today(), shortlist, set(qualified), tags=tags)
         logger.info("forward log: recorded %d scan candidates (15:20 prices)", logged)
     except Exception as exc:  # noqa: BLE001
         logger.warning("forward log: recording skipped (%s)", exc)
