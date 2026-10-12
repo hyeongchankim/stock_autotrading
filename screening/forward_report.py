@@ -27,6 +27,9 @@ def to_frame(records: list[dict], round_trip_cost: float) -> pd.DataFrame:
     for col in ("close", "open_next", "close_next"):
         if col not in df:
             df[col] = float("nan")
+    for col in ("scan_tag", "eod_tag"):  # L1 flags (screening/gap_tag.py): True / False / None when untagged or unjudgeable
+        tags = df[col] if col in df else pd.Series([None] * len(df), index=df.index)
+        df[col.replace("_tag", "_l1")] = tags.map(lambda t: t.get("l1") if isinstance(t, dict) else None).astype("object")
     df["scan->close"] = (df["close"] / df["price_scan"] - 1) * 100
     df["scan->open+1"] = ((df["open_next"] / df["price_scan"] - 1) - round_trip_cost) * 100
     df["open+1->close+1"] = (df["close_next"] / df["open_next"] - 1) * 100
@@ -41,6 +44,12 @@ def summarize(df: pd.DataFrame, top_ns: tuple[int, ...] = (3, 5, 10)) -> pd.Data
     groups = {f"top-{n} by change%": df["rank"] <= n for n in top_ns}
     groups["qualified (2+ checkpoints)"] = df["qualified"]
     groups["all logged"] = df["rank"] > 0
+    # L1 = volume x2 + gap-up above the trend line (backtest: +0.34% overnight). "@15:20" is the tradable view
+    # (volume so far today); "by close" is the backtest's own full-day definition.
+    for col, label in (("scan_l1", "@15:20"), ("eod_l1", "by close")):
+        if col in df:
+            groups[f"L1 {label}"] = df[col].eq(True)
+            groups[f"not L1 {label}"] = df[col].eq(False)
     rows = []
     for label, mask in groups.items():
         sub = df[mask & df["open_next"].notna()]

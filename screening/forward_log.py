@@ -18,6 +18,7 @@ from datetime import date, datetime, time
 
 import pandas as pd
 
+from screening.gap_tag import tag_eod
 from utils.state_store import StateStore
 
 logger = logging.getLogger("screening.forward_log")
@@ -29,11 +30,14 @@ _OUTCOME_FIELDS = ("close", "open_next", "close_next")
 
 
 def record_candidates(
-    store: StateStore, as_of: date, candidates: pd.DataFrame, qualified: set[str], now: datetime | None = None
+    store: StateStore, as_of: date, candidates: pd.DataFrame, qualified: set[str], now: datetime | None = None,
+    tags: dict[str, dict] | None = None,
 ) -> int:
     """Logs today's scan (columns: symbol, name, price, change_pct, volume,
     trading_value), ranked by change% desc. Re-running the same day replaces that
-    day's rows instead of duplicating them. Returns the number of rows logged.
+    day's rows instead of duplicating them. `tags` ({symbol: L1 features} from
+    screening/gap_tag.tag_scan) is stored as each row's `scan_tag` when given.
+    Returns the number of rows logged.
     """
     now = now or datetime.now()
     ranked = candidates.sort_values("change_pct", ascending=False).to_dict("records")
@@ -43,6 +47,7 @@ def record_candidates(
             "price_scan": float(r["price"]), "change_pct": float(r["change_pct"]), "volume": int(r["volume"]),
             "trading_value": float(r["trading_value"]), "qualified": r["symbol"] in qualified,
             "scanned_at": now.isoformat(timespec="seconds"),
+            **({"scan_tag": tags[r["symbol"]]} if tags and r["symbol"] in tags else {}),
         }
         for i, r in enumerate(ranked)
     ]
@@ -57,13 +62,15 @@ def _pending(records: list[dict]) -> list[dict]:
     return [r for r in records if any(f not in r for f in _OUTCOME_FIELDS)]
 
 
-def fill_outcomes(store: StateStore, feed, now: datetime | None = None, lookback: int = 30) -> int:
+def fill_outcomes(store: StateStore, feed, now: datetime | None = None, lookback: int = 70) -> int:
     """Fills close / open_next / close_next for logged rows from daily bars
     (`feed.get_ohlcv(symbol, "1d", lookback)`), skipping bars whose value isn't
     final yet (today's close before 15:40, today's open before 09:05). Runs at
     most once per calendar day; the next trading day is the first bar after the
     logged date, so holidays and weekends need no calendar. Never raises: a data
-    problem must not take the trading run down. Returns the number of fields filled.
+    problem must not take the trading run down. Also adds each row's `eod_tag` (the L1 rule on the
+    finished signal-day bar, screening/gap_tag.py) - the bars are already fetched here, and 70 of them
+    cover the 60-day trend line. Returns the number of fields filled.
     """
     now = now or datetime.now()
     today = now.date()
@@ -78,8 +85,9 @@ def fill_outcomes(store: StateStore, feed, now: datetime | None = None, lookback
     bars: dict[str, pd.DataFrame | None] = {}
     filled = 0
     failed = False
-    for rec in _pending(records):
-        symbol = rec["symbol"]
+
+    def get_bars(symbol: str) -> pd.DataFrame | None:
+        nonlocal failed
         if symbol not in bars:
             try:
                 bars[symbol] = feed.get_ohlcv(symbol, "1d", lookback)
@@ -87,7 +95,11 @@ def fill_outcomes(store: StateStore, feed, now: datetime | None = None, lookback
                 logger.warning("forward log: no bars for %s (%s)", symbol, exc)
                 bars[symbol] = None
                 failed = True
-        df = bars[symbol]
+        return bars[symbol]
+
+    for rec in _pending(records):
+        symbol = rec["symbol"]
+        df = get_bars(symbol)
         if df is None or df.empty:
             continue
 
@@ -104,6 +116,8 @@ def fill_outcomes(store: StateStore, feed, now: datetime | None = None, lookback
             if "close_next" not in rec and final(nxt.date(), _CLOSE_FINAL):
                 rec["close_next"] = float(df.loc[nxt, "close"])
                 filled += 1
+
+    tag_eod(records, get_bars, lambda d: final(d, _CLOSE_FINAL))  # not counted in `filled` (that stays outcome fields only)
 
     if not failed:
         state["last_fill"] = today.isoformat()

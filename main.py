@@ -29,6 +29,7 @@ from screening.checkpoint_store import persistent_candidates, record_checkpoint
 from data.market_calendar import market_closed_today
 from screening.dynamic_watchlist import current_movers, merge_with_held
 from screening.forward_log import fill_outcomes, record_candidates
+from screening.gap_tag import tag_scan
 from screening.discover import filter_candidates, get_universe, scan_market
 from strategies.close_strength import CloseStrengthStrategy
 from strategies.mean_reversion import RSIStrategy, VolatilityBreakoutStrategy
@@ -506,7 +507,9 @@ def run_discovery(config: dict, checkpoint: str) -> None:
         disc_cfg["min_checkpoints"], final_candidates,
     )
     try:
-        logged = record_candidates(StateStore(FORWARD_LOG_FILE), date.today(), today_candidates, set(qualified))
+        # L1 tag (screening/gap_tag.py): evaluated now, on the still-open daily bars - the tradable view
+        tags = tag_scan(KisDataFeed(env=env), today_candidates["symbol"].tolist(), date.today())
+        logged = record_candidates(StateStore(FORWARD_LOG_FILE), date.today(), today_candidates, set(qualified), tags=tags)
         logger.info("forward log: recorded %d scan candidates (15:20 prices)", logged)
     except Exception as exc:  # noqa: BLE001
         logger.warning("forward log: recording skipped (%s)", exc)
