@@ -223,6 +223,7 @@ def build_engine(
         rank_entries_by_momentum=signal_cfg.get("rank_entries_by_momentum", False),
         momentum_window=signal_cfg.get("momentum_window", 20),
         notify=notify,
+        reentry_policy=signal_cfg.get("reentry_policy", "off"),
     )
 
 
@@ -412,6 +413,7 @@ def run_macd_sleeve(config: dict) -> None:
         regime_filter=None,
         entry_mode="any",
         volume_filter=None,
+        reentry_policy=config.get("signal_combination", {}).get("reentry_policy", "off"),
     )
 
     store = StateStore(MACD_STATE_FILE)
@@ -561,6 +563,7 @@ def run_discovery(config: dict, checkpoint: str) -> None:
         regime_filter=build_regime_filter(config),
         entry_mode="any",
         volume_filter=build_volume_filter(config),
+        reentry_policy=config.get("signal_combination", {}).get("reentry_policy", "off"),
     )
 
     windows = {}

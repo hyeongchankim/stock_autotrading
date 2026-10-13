@@ -76,9 +76,12 @@ class TradingEngine:
         rank_entries_by_momentum: bool = False,
         momentum_window: int = 20,
         notify: bool = True,
+        reentry_policy: str = "off",
     ):
         if entry_mode not in ("all", "any"):
             raise ValueError("entry_mode must be 'all' or 'any'")
+        if reentry_policy not in ("off", "block_day", "net_same_cycle"):
+            raise ValueError("reentry_policy must be 'off', 'block_day' or 'net_same_cycle'")
         self.broker = broker
         self.data_feed = data_feed
         self.strategies = strategies
@@ -95,6 +98,14 @@ class TradingEngine:
         self.notify = notify
         self.rank_entries_by_momentum = rank_entries_by_momentum
         self.momentum_window = momentum_window
+        # What to do when a strategy SELL and a BUY vote meet on one symbol (2026-10-13: RSI sold 두산테스나 as
+        # overbought and close_strength bought it back 31 s later, 3 round trips in 90 min, ~0.21% cost each):
+        #   "off"            existing behaviour (default for callers that don't opt in)
+        #   "block_day"      a symbol exited today is not bought again today
+        #   "net_same_cycle" a strategy SELL is skipped (hold) when the entry pass would buy the symbol straight
+        #                    back in the same cycle - that sell+rebuy only pays costs for the same position
+        self.reentry_policy = reentry_policy
+        self._exited_this_cycle: set[str] = set()   # protective exits made during the current run_once
 
     def run_once(
         self,
@@ -109,6 +120,7 @@ class TradingEngine:
         """
         as_of = as_of or date.today()
         self.risk_manager.roll_to_day(as_of)
+        self._exited_this_cycle = set()
 
         windows: dict[str, pd.DataFrame] = {}
         if precomputed_windows is not None:
@@ -164,6 +176,8 @@ class TradingEngine:
         env = _broker_label(self.broker)
         if result.filled:
             self.risk_manager.record_realized_pnl(result.realized_pnl)
+            self.risk_manager.record_exit(symbol)
+            self._exited_this_cycle.add(symbol)
             self.risk_manager.clear_peak_price(symbol)
             logger.info(
                 "%s: %s exit, qty=%s price=%.2f pnl=%.2f",
@@ -190,10 +204,20 @@ class TradingEngine:
         if not sell_signals:
             return
 
+        if self.reentry_policy == "net_same_cycle":
+            rebuy = self._find_entry_candidate(symbol, ohlcv, current_price, assume_flat=True)
+            if rebuy is not None:
+                logger.info(
+                    "%s: strategy exit skipped - %s would buy it straight back (%s), holding",
+                    symbol, rebuy.strategy_names, sell_signals[0].strategy_name,
+                )
+                return
+
         result = self.broker.place_order(symbol, Signal.SELL, position.quantity, current_price)
         env = _broker_label(self.broker)
         if result.filled:
             self.risk_manager.record_realized_pnl(result.realized_pnl)
+            self.risk_manager.record_exit(symbol)
             self.risk_manager.clear_peak_price(symbol)
             logger.info(
                 "%s: strategy exit (%s), qty=%s price=%.2f pnl=%.2f",
@@ -208,9 +232,10 @@ class TradingEngine:
             self._notify(f"[{env}] strategy exit FAILED: {symbol} - {result.message}")
 
     def _find_entry_candidate(
-        self, symbol: str, ohlcv: pd.DataFrame, current_price: float
+        self, symbol: str, ohlcv: pd.DataFrame, current_price: float, assume_flat: bool = False
     ) -> EntryCandidate | None:
-        if self.broker.get_positions().get(symbol) is not None:
+        """assume_flat=True asks "would we enter if we held nothing in this symbol?" (net_same_cycle policy)."""
+        if not assume_flat and self.broker.get_positions().get(symbol) is not None:
             return None
         if not self.risk_manager.can_open_new_position():
             return None
@@ -240,6 +265,17 @@ class TradingEngine:
             return None
 
         if self.volume_filter is not None and not self.volume_filter.confirms(ohlcv):
+            return None
+
+        if self.reentry_policy == "net_same_cycle" and symbol in self._exited_this_cycle:
+            logger.info("%s: re-entry blocked - stopped out / took profit earlier in this cycle", symbol)
+            return None
+
+        if self.reentry_policy == "block_day" and self.risk_manager.has_exited_today(symbol):
+            logger.info(
+                "%s: re-entry blocked - already exited today (%s signal ignored)",
+                symbol, ",".join(sig.strategy_name for sig in buy_signals),
+            )
             return None
 
         momentum = 0.0

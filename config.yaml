@@ -73,6 +73,11 @@ signal_combination:
   rank_entries_by_momentum: false   # true면 같은 날 여러 종목이 동시에 신호를 낼 때
                                     # 최근 momentum_window일 수익률이 가장 큰 종목부터 자본 배정
   momentum_window: 20
+  reentry_policy: "off"       # (따옴표 필수: YAML에서 따옴표 없는 off는 문자열이 아니라 False로 읽힘)
+                               # 같은 종목에서 전략 SELL과 BUY가 부딪힐 때 (2026-10-13 두산테스나: RSI 과열 매도 -> close_strength 매수가 31초
+                               # 간격으로 90분간 3번 왕복, 왕복비용 ~0.21%씩). off = 기존 동작 | block_day = 오늘 청산한 종목은 오늘 재매수 금지 |
+                               # net_same_cycle = 같은 사이클에 되살 신호면 매도를 건너뛰고 보유. 청산 이력은 슬리브별 상태파일에 저장돼 유지됨.
+                               # 워치리스트/MACD/발굴형 슬리브 모두 적용. 백테스트 비교는 CONTEXT_HANDOFF.md 36번
 
 volume_filter:
   enabled: true      # 백테스트로 검증한 순수 개선 (아래 "다음 방향 검증 기록" 참고)

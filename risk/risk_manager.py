@@ -41,6 +41,9 @@ class RiskManager:
         self._current_day: date | None = None
         self.daily_realized_pnl = 0.0
         self.trading_halted_today = False
+        # Symbols exited today (stop-loss, take-profit or a strategy SELL) - used by the engine's "block_day"
+        # re-entry policy (see TradingEngine.reentry_policy).
+        self.exited_today: set[str] = set()
 
     def roll_to_day(self, as_of: date) -> None:
         """Resets daily counters when the trading day changes."""
@@ -48,6 +51,13 @@ class RiskManager:
             self._current_day = as_of
             self.daily_realized_pnl = 0.0
             self.trading_halted_today = False
+            self.exited_today = set()
+
+    def record_exit(self, symbol: str) -> None:
+        self.exited_today.add(symbol)
+
+    def has_exited_today(self, symbol: str) -> bool:
+        return symbol in self.exited_today
 
     def can_open_new_position(self) -> bool:
         return not self.trading_halted_today
@@ -87,6 +97,7 @@ class RiskManager:
             "date": self._current_day.isoformat() if self._current_day else None,
             "daily_realized_pnl": self.daily_realized_pnl,
             "trading_halted_today": self.trading_halted_today,
+            "exited_today": sorted(self.exited_today),
         }
 
     def restore(self, state: dict) -> None:
@@ -102,3 +113,4 @@ class RiskManager:
         self._current_day = date.fromisoformat(date_str)
         self.daily_realized_pnl = state.get("daily_realized_pnl", 0.0)
         self.trading_halted_today = state.get("trading_halted_today", False)
+        self.exited_today = set(state.get("exited_today", []))
