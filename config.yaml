@@ -177,6 +177,9 @@ broker:
                     # backtest 모드는 provider 값과 무관하게 항상 mock+yfinance로 돈다
                     # (실계좌 API에 반복 조회하기엔 느리고 rate limit이 걸림).
   kis:
+    exit_order_type: "limit"   # 청산(SELL) 주문 방식: "limit" = 현재가 지정가(기존) | "market" = 시장가. 2026-10-13 지정가 매도가 가격 하락으로
+                                # 미체결(두산테스나 15주)로 남은 사건 때문에 추가. 모의투자에서 시장가가 실제로 체결되는지 장중 1주 테스트
+                                # (scripts/market_order_test.py)로 확인한 뒤에만 "market"으로 바꿀 것. 진입(BUY)은 항상 지정가. 따옴표 필수.
     env: demo       # demo(모의투자) | real(실전투자)
                     # 절대 real을 기본값으로 두지 말 것 - 모의투자로 충분히 검증 후에만 전환.
                     # KIS_APP_KEY/KIS_APP_SECRET(실전), KIS_PAPER_APP_KEY/KIS_PAPER_APP_SECRET(모의),

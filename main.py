@@ -166,6 +166,7 @@ def build_broker(config: dict, seed_capital: float | None = None) -> BrokerBase:
             seed_capital=seed_capital,
             commission_pct=costs_cfg.get("commission_pct", 0.0),
             sell_tax_pct=costs_cfg.get("sell_tax_pct", 0.0),
+            exit_order_type=kis_cfg.get("exit_order_type", "limit"),
         )
 
     return MockBroker(
@@ -272,13 +273,17 @@ def dynamic_symbols(config: dict, broker: BrokerBase, strategy_seed: float) -> l
     return symbols
 
 
-def reconcile_orders(broker) -> None:
+def reconcile_orders(broker, risk_manager=None) -> None:
     """Book the late fills of orders that looked unfilled last run (KisBroker only), before the
-    engine reads positions. Best-effort: a failure here must never stop the cycle."""
+    engine reads positions; a SELL that filled late hands its P&L to the risk manager (daily-loss
+    breaker). Best-effort: a failure here must never stop the cycle."""
     if not isinstance(broker, KisBroker):
         return
     try:
         broker.reconcile_pending()
+        pnl = broker.take_late_realized_pnl()
+        if pnl and risk_manager is not None:
+            risk_manager.record_realized_pnl(pnl)
     except Exception as exc:  # noqa: BLE001
         logger.warning("pending-order reconciliation skipped (%s)", exc)
 
@@ -316,7 +321,7 @@ def run_paper(config: dict) -> None:
     engine.risk_manager.restore(state.get("risk_manager", {}))
     if isinstance(broker, KisBroker):
         broker.restore_ledger(state.get("kis_cash_ledger", {}))
-    reconcile_orders(broker)
+    reconcile_orders(broker, engine.risk_manager)
     # roll_to_day here (redundant but harmless - run_once() does it again)
     # so was_halted_today below reflects *today's* state, not a stale halt
     # carried over from a previous day's restore().
@@ -421,7 +426,7 @@ def run_macd_sleeve(config: dict) -> None:
     engine.risk_manager.restore(state.get("risk_manager", {}))
     if isinstance(broker, KisBroker):
         broker.restore_ledger(state.get("kis_cash_ledger", {}))
-    reconcile_orders(broker)
+    reconcile_orders(broker, risk_manager)
     engine.risk_manager.roll_to_day(date.today())
     was_halted_today = engine.risk_manager.trading_halted_today
 
@@ -527,6 +532,7 @@ def run_discovery(config: dict, checkpoint: str) -> None:
         env=env, watchlist=list(universe.keys()), seed_capital=disc_cfg["seed_capital"],
         commission_pct=config.get("costs", {}).get("commission_pct", 0.0),
         sell_tax_pct=config.get("costs", {}).get("sell_tax_pct", 0.0),
+        exit_order_type=kis_cfg.get("exit_order_type", "limit"),
     )
     data_feed = KisDataFeed(env=env, session=broker.session)
     risk_manager = RiskManager(
@@ -541,7 +547,7 @@ def run_discovery(config: dict, checkpoint: str) -> None:
     state = store.load()
     risk_manager.restore(state.get("risk_manager", {}))
     broker.restore_ledger(state.get("kis_cash_ledger", {}))
-    reconcile_orders(broker)
+    reconcile_orders(broker, risk_manager)
     risk_manager.roll_to_day(date.today())
 
     held = set(broker.get_positions().keys())

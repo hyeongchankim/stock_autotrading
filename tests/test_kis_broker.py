@@ -685,10 +685,10 @@ class TestKisBrokerPartialFill(unittest.TestCase):
     @patch("broker.kis_broker.time.sleep")
     @patch("broker.kis_auth.requests.get")
     @patch("broker.kis_broker.requests.post")
-    def test_falls_back_to_requested_qty_if_position_never_updates(self, mock_post, mock_get, _mock_sleep):
-        # get_positions() keeps reporting the pre-order quantity on every
-        # poll (simulates the account never reflecting the fill in time) -
-        # must fall back to assuming the requested quantity filled, not 0.
+    def test_a_sell_whose_position_never_drops_is_reported_unfilled_not_assumed_filled(self, mock_post, mock_get, _mock_sleep):
+        # get_positions() keeps reporting the pre-order quantity on every poll: the sell did NOT fill (2026-10-13:
+        # a limit sell of 두산테스나 sat unfilled and was booked as sold). It must come back unfilled, so the caller
+        # does not book proceeds or drop the position; place_order tracks it as pending instead.
         stale = MagicMock(
             status_code=200,
             json=lambda: {
@@ -702,8 +702,9 @@ class TestKisBrokerPartialFill(unittest.TestCase):
             status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "1"}}
         )
         result = self.broker.place_order("005930.KS", Signal.SELL, 5, 150.0)
-        self.assertEqual(result.quantity, 5)
-        self.assertAlmostEqual(result.realized_pnl, (150.0 - 100.0) * 5)
+        self.assertFalse(result.filled)
+        self.assertEqual(result.quantity, 0)
+        self.assertIn("not filled yet", result.message)
 
     @patch("broker.kis_broker.time.sleep")
     @patch("broker.kis_auth.requests.get")
@@ -973,6 +974,162 @@ class TestSleeveCashIsEnforced(unittest.TestCase):
         mock_get.side_effect = [self._account(0), self._account(1_000)]
         mock_post.return_value = MagicMock(status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "1"}})
         self.assertTrue(broker.place_order("005930.KS", Signal.BUY, 1_000, 100_000.0).filled)
+
+
+class TestSellSideFixes(unittest.TestCase):
+    """2026-10-13: a limit SELL that never filled was booked as sold (cash +2.0M, position gone, shares left
+    unmanaged in the account). An unconfirmed SELL is now pending, not a fill; exits can also go out as market orders."""
+
+    COST = dict(commission_pct=0.015, sell_tax_pct=0.18)
+
+    def setUp(self):
+        self.env_patcher = _env_patch()
+        self.env_patcher.start()
+        self.token_patcher = patch("broker.kis_auth.KisSession.get_access_token", return_value="fake-token")
+        self.token_patcher.start()
+        self.sleep_patcher = patch("broker.kis_broker.time.sleep")
+        self.sleep_patcher.start()
+
+    def tearDown(self):
+        self.sleep_patcher.stop()
+        self.token_patcher.stop()
+        self.env_patcher.stop()
+
+    def _broker(self, exit_order_type="limit"):
+        b = KisBroker(env="demo", watchlist=["005930.KS"], seed_capital=1_000_000.0, exit_order_type=exit_order_type, **self.COST)
+        b.restore_ledger({"cash": 500_000.0, "positions": {"005930.KS": {"quantity": 5, "avg_price": 100_000.0}}})
+        return b
+
+    @staticmethod
+    def _account(qty):
+        rows = [{"pdno": "005930", "hldg_qty": str(qty), "pchs_avg_pric": "100000"}] if qty else []
+        return MagicMock(status_code=200, json=lambda: {"rt_cd": "0", "output1": rows, "output2": [{"dnca_tot_amt": "0"}]})
+
+    @staticmethod
+    def _accepted(odno="0000035731"):
+        return MagicMock(status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": odno}})
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_an_unconfirmed_limit_sell_changes_nothing_in_the_ledger_and_is_tracked(self, mock_get, mock_post):
+        b = self._broker()
+        mock_get.return_value = self._account(5)   # shares never leave the account
+        mock_post.return_value = self._accepted()
+        result = b.place_order("005930.KS", Signal.SELL, 5, 110_000.0)
+        self.assertFalse(result.filled)
+        self.assertEqual(b.get_cash_balance(), 500_000.0)                       # no proceeds credited
+        self.assertEqual(b.ledger_to_dict()["positions"]["005930.KS"]["quantity"], 5)   # still owned
+        pending = b.ledger_to_dict()["pending_orders"]
+        self.assertEqual([(o["order_no"], o["side"], o["quantity"], o["applied_qty"]) for o in pending], [("0000035731", "SELL", 5, 0)])
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_no_second_sell_is_sent_while_one_is_pending(self, mock_get, mock_post):
+        b = self._broker()
+        mock_get.return_value = self._account(5)
+        mock_post.return_value = self._accepted()
+        b.place_order("005930.KS", Signal.SELL, 5, 110_000.0)
+        posts = mock_post.call_count
+        again = b.place_order("005930.KS", Signal.SELL, 5, 109_000.0)
+        self.assertFalse(again.filled)
+        self.assertIn("still pending", again.message)
+        self.assertEqual(mock_post.call_count, posts)
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_a_late_sell_fill_is_booked_once_and_its_pnl_is_handed_over(self, mock_get, mock_post):
+        b = self._broker()
+        mock_get.return_value = self._account(5)
+        mock_post.return_value = self._accepted()
+        b.place_order("005930.KS", Signal.SELL, 5, 110_000.0)
+        filled = [OrderFill("0000035731", "005930.KS", 5, 5, 0, 110_000.0)]
+        with patch.object(b, "get_daily_fills", return_value=filled):
+            self.assertEqual(b.reconcile_pending(), 5)
+            self.assertEqual(b.reconcile_pending(), 0)    # nothing left to book
+        effective = 110_000.0 * (1 - 0.00015 - 0.0018)
+        self.assertAlmostEqual(b.get_cash_balance(), 500_000.0 + 5 * effective)
+        self.assertNotIn("005930.KS", b.ledger_to_dict()["positions"])
+        self.assertAlmostEqual(b.take_late_realized_pnl(), (effective - 100_000.0) * 5)
+        self.assertEqual(b.take_late_realized_pnl(), 0.0)   # handed over exactly once
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_market_exit_orders_carry_no_price_and_book_at_the_real_average_price(self, mock_get, mock_post):
+        b = self._broker(exit_order_type="market")
+        mock_get.return_value = self._account(5)
+        mock_post.return_value = self._accepted("0000040001")
+        fills = [OrderFill("0000040001", "005930.KS", 5, 5, 0, 109_000.0)]   # filled below the 110,000 quote
+        with patch.object(b, "get_daily_fills", return_value=fills):
+            result = b.place_order("005930.KS", Signal.SELL, 5, 110_000.0)
+        sent = mock_post.call_args.kwargs["json"]
+        self.assertEqual((sent["ORD_DVSN"], sent["ORD_UNPR"]), ("01", "0"))
+        self.assertTrue(result.filled)
+        self.assertEqual((result.quantity, result.price), (5, 109_000.0))     # the actual average price
+        effective = 109_000.0 * (1 - 0.00015 - 0.0018)
+        self.assertAlmostEqual(result.realized_pnl, (effective - 100_000.0) * 5)
+        self.assertAlmostEqual(b.get_cash_balance(), 500_000.0 + 5 * effective)
+        self.assertNotIn("005930.KS", b.ledger_to_dict()["positions"])
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_a_market_sell_is_confirmed_by_the_position_when_the_fill_report_is_missing(self, mock_get, mock_post):
+        b = self._broker(exit_order_type="market")
+        mock_get.side_effect = [self._account(5), self._account(0)]   # pre-order read, then the shares are gone
+        mock_post.return_value = self._accepted("0000040002")
+        with patch.object(b, "get_daily_fills", side_effect=RuntimeError("KIS 500")):
+            result = b.place_order("005930.KS", Signal.SELL, 5, 110_000.0)
+        self.assertTrue(result.filled)
+        self.assertEqual(result.quantity, 5)
+        self.assertEqual(result.price, 110_000.0)    # no better information than the quote
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_a_market_sell_with_no_evidence_of_a_fill_is_pending_not_filled(self, mock_get, mock_post):
+        b = self._broker(exit_order_type="market")
+        mock_get.return_value = self._account(5)
+        mock_post.return_value = self._accepted("0000040003")
+        with patch.object(b, "get_daily_fills", return_value=[]):
+            result = b.place_order("005930.KS", Signal.SELL, 5, 110_000.0)
+        self.assertFalse(result.filled)
+        self.assertEqual(b.ledger_to_dict()["positions"]["005930.KS"]["quantity"], 5)
+        self.assertEqual(len(b.ledger_to_dict()["pending_orders"]), 1)
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
+    def test_buys_stay_limit_orders_even_when_exits_are_market(self, mock_get, mock_post):
+        b = KisBroker(env="demo", watchlist=["005930.KS"], seed_capital=1_000_000.0, exit_order_type="market")
+        mock_get.side_effect = [self._account(0), self._account(2)]
+        mock_post.return_value = self._accepted("0000040004")
+        b.place_order("005930.KS", Signal.BUY, 2, 70_000.0)
+        sent = mock_post.call_args.kwargs["json"]
+        self.assertEqual((sent["ORD_DVSN"], sent["ORD_UNPR"]), ("00", "70000"))
+
+    def test_the_order_type_is_validated(self):
+        with self.assertRaises(ValueError):
+            KisBroker(env="demo", exit_order_type="sometimes")
+
+    def test_the_real_config_selects_a_valid_exit_order_type(self):
+        from pathlib import Path
+
+        import yaml
+
+        cfg = yaml.safe_load((Path(__file__).resolve().parent.parent / "config.yaml").read_text(encoding="utf-8"))
+        self.assertIn(cfg["broker"]["kis"]["exit_order_type"], ("limit", "market"))   # an unquoted YAML value would be non-str
+
+
+class TestReconcileHandsPnlToRisk(unittest.TestCase):
+    def test_late_sell_pnl_reaches_the_risk_manager_through_main(self):
+        import main as app
+        from risk.risk_manager import RiskManager
+
+        broker = KisBroker.__new__(KisBroker)           # no network: only the two methods main calls are used
+        calls = []
+        broker.reconcile_pending = lambda: calls.append("reconcile")
+        broker.take_late_realized_pnl = lambda: -12_345.0
+        risk = RiskManager(seed_capital=1_000_000)
+        app.reconcile_orders(broker, risk)
+        self.assertEqual(calls, ["reconcile"])
+        self.assertEqual(risk.daily_realized_pnl, -12_345.0)
 
 if __name__ == "__main__":
     unittest.main()

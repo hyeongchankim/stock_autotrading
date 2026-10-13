@@ -90,6 +90,7 @@ class KisBroker(BrokerBase):
         seed_capital: float | None = None,
         commission_pct: float = 0.0,
         sell_tax_pct: float = 0.0,
+        exit_order_type: str = "limit",
     ):
         """seed_capital, if given, switches get_cash_balance()/get_total_equity()
         to a locally tracked cash ledger scoped to that amount instead of the
@@ -129,6 +130,13 @@ class KisBroker(BrokerBase):
         self._owned: dict[str, dict] | None = {} if seed_capital is not None else None
         self.commission_pct = commission_pct
         self.sell_tax_pct = sell_tax_pct
+        # "limit": SELLs go out as a 지정가 at the current price (the original behaviour). "market": SELLs go out as a
+        # 시장가 (ORD_DVSN 01) so an exit can't sit unfilled while the price falls - 2026-10-13 a 14:31 limit sell of
+        # 두산테스나 never filled and was booked as sold anyway. Entries are always limit orders.
+        if exit_order_type not in ("limit", "market"):
+            raise ValueError("exit_order_type must be 'limit' or 'market'")
+        self.exit_order_type = exit_order_type
+        self._late_realized_pnl = 0.0   # P&L of SELL fills booked late by reconcile_pending (handed to RiskManager)
         self._positions_cache: tuple[float, dict] | None = None
         # Orders KIS accepted that had not (fully) filled when place_order returned. A limit order can fill
         # minutes later (2026-10-06 09:00: a 31-share BUY the MACD sleeve thought had failed filled afterwards and
@@ -342,25 +350,16 @@ class KisBroker(BrokerBase):
         return fill_price * (1 - self.commission_pct / 100 - self.sell_tax_pct / 100)
 
     def _actual_sold_qty(self, symbol: str, pre_qty: int, requested_qty: int) -> int:
-        """After KIS accepts a SELL order (rt_cd="0"), the account's own
-        position may take a few seconds to reflect the fill - observed
-        empirically this session (get_positions() sometimes lagged 3-10+
-        seconds behind a just-filled order). Polls briefly for the held
-        quantity to actually drop; if it never does within the retry
-        budget, falls back to requested_qty (assume it fully filled) rather
-        than reporting 0 - a stale read would otherwise make a real fill
-        look like nothing happened, which is worse for RiskManager's
-        realized_pnl tracking than the pre-existing (also imperfect)
-        assume-it-fully-filled behavior.
+        """After KIS accepts a SELL order (rt_cd="0"), the account's own position may take a few seconds to reflect
+        the fill (get_positions() sometimes lagged 3-10+ seconds behind a just-filled order). Polls briefly for the
+        held quantity to drop and returns how much did. If it never drops within the retry budget the order is
+        reported as NOT filled (0): place_order tracks it as pending and reconcile_pending() books it once KIS says
+        it filled.
 
-        This exists because place_order() previously computed realized_pnl
-        off the requested quantity regardless of how much actually filled -
-        a stop-loss SELL that only partially fills would have recorded a
-        too-large realized loss, corrupting the daily_max_loss_pct circuit
-        breaker's accuracy. Scoped to SELL only: a partially-filled BUY
-        just means a smaller position, which self-corrects next cycle via
-        the engine's normal get_positions() read and isn't risk-critical
-        the way realized P&L accounting is.
+        This used to fall back to "assume the full quantity filled", to keep realized_pnl / the daily-loss breaker
+        from missing a real fill behind a stale read. On 2026-10-13 that booked a 15-share 두산테스나 sale whose limit
+        order never filled: cash was credited ~2.0M, the position vanished from the ledger and stayed unmanaged in
+        the account. A missed fill is recoverable (reconcile_pending books it); a phantom sale is not.
         """
         for attempt in range(_MAX_RETRIES):
             post_qty = self._account_qty(symbol)
@@ -369,7 +368,28 @@ class KisBroker(BrokerBase):
                 return min(sold, requested_qty)
             if attempt < _MAX_RETRIES - 1:
                 time.sleep(_RETRY_BACKOFF_SECONDS)
-        return requested_qty
+        return 0
+
+    def _confirmed_fill(self, order_no: str, attempts: int = 3) -> tuple[int, float | None]:
+        """(filled_qty, average fill price) of an order from KIS's own order-fill query, or (0, None) if KIS does not
+        (yet) report a fill or the lookup fails. Used for market orders, whose price is unknown until they fill."""
+        for attempt in range(attempts):
+            try:
+                fills = [f for f in self.get_daily_fills(order_no) if f.order_no == order_no]
+            except Exception as exc:  # noqa: BLE001 - fall back to the position check
+                logger.warning("fill lookup for order %s failed (%s)", order_no, exc)
+                fills = []
+            if fills and fills[0].filled_qty > 0:
+                return fills[0].filled_qty, (fills[0].avg_fill_price or None)
+            if attempt < attempts - 1:
+                time.sleep(_RETRY_BACKOFF_SECONDS)
+        return 0, None
+
+    def take_late_realized_pnl(self) -> float:
+        """P&L of SELL fills that reconcile_pending() booked since the last call (then reset to 0) - the caller feeds
+        it to RiskManager so the daily-loss breaker sees exits that filled after place_order returned."""
+        pnl, self._late_realized_pnl = self._late_realized_pnl, 0.0
+        return pnl
 
     def _actual_bought_qty(self, symbol: str, pre_qty: int, requested_qty: int) -> int:
         """BUY counterpart to _actual_sold_qty, with the opposite timeout
@@ -431,6 +451,11 @@ class KisBroker(BrokerBase):
                 symbol, side, quantity, fill_price, False,
                 "a BUY order for this symbol is still pending - not sending a second one",
             )
+        if side == Signal.SELL and any(o["symbol"] == symbol and o["side"] == "SELL" for o in self._pending):
+            return OrderResult(
+                symbol, side, quantity, fill_price, False,
+                "a SELL order for this symbol is still pending - not sending a second one",
+            )
         if side == Signal.BUY and self._cash_ledger is not None:
             # Same rule as MockBroker, which every backtest ran on: a buy the sleeve's cash can't cover is
             # refused, not sent. Without it a 4th position took the MACD sleeve to -224k cash on 2026-10-07
@@ -453,13 +478,14 @@ class KisBroker(BrokerBase):
                 "PLACING REAL-MONEY ORDER: %s %s x%s @ %.0f", side.value, symbol, quantity, fill_price
             )
 
+        market = side == Signal.SELL and self.exit_order_type == "market"
         body = {
             "CANO": self.session.account_no,
             "ACNT_PRDT_CD": self.session.account_product_cd,
             "PDNO": ticker,
-            "ORD_DVSN": "00",  # 지정가 (limit order at fill_price)
+            "ORD_DVSN": "01" if market else "00",  # 시장가 for exits when configured, otherwise 지정가 at fill_price
             "ORD_QTY": str(quantity),
-            "ORD_UNPR": str(int(fill_price)),
+            "ORD_UNPR": "0" if market else str(int(fill_price)),  # a market order carries no price
         }
         response = _post_no_ambiguous_retry(self._order_endpoint(), self.session.headers(tr_id), body)
         if response.status_code >= 500:
@@ -478,13 +504,22 @@ class KisBroker(BrokerBase):
         self._positions_cache = None  # the order was accepted: positions are about to change
         pre_ticker = _to_kis_ticker(symbol)
         pre_qty = sum(p.quantity for s, p in account_positions.items() if _to_kis_ticker(s) == pre_ticker)
-        actual_qty = quantity
         realized_pnl = 0.0
         if side == Signal.BUY:
             actual_qty = self._actual_bought_qty(symbol, pre_qty, quantity)
-        elif pre_position is not None:
-            actual_qty = self._actual_sold_qty(symbol, pre_qty, quantity)
-            realized_pnl = (self._effective_price(side, fill_price) - pre_position.avg_price) * actual_qty
+        else:
+            actual_qty = 0
+            if market:  # the fill price is only known from KIS's report, so book at the real average price
+                actual_qty, avg_price = self._confirmed_fill(order_no)
+                actual_qty = min(actual_qty, quantity)
+                if actual_qty > 0 and avg_price:
+                    fill_price = avg_price
+            if actual_qty <= 0:
+                # no position to diff against only happens for an unscoped account-inspection broker: nothing to check,
+                # the order is taken at its word
+                actual_qty = self._actual_sold_qty(symbol, pre_qty, quantity) if pre_position is not None else quantity
+            if pre_position is not None and actual_qty > 0:
+                realized_pnl = (self._effective_price(side, fill_price) - pre_position.avg_price) * actual_qty
 
         if actual_qty <= 0:
             self._track_pending(order_no, symbol, side, quantity, fill_price, applied_qty=0)
@@ -550,7 +585,12 @@ class KisBroker(BrokerBase):
             fill = fills[0] if fills else None
             if fill is not None and fill.filled_qty > order["applied_qty"]:
                 late = fill.filled_qty - order["applied_qty"]
-                self._book(Signal(order["side"]), order["symbol"], late, fill.avg_fill_price or order["price"])
+                late_side, late_price = Signal(order["side"]), fill.avg_fill_price or order["price"]
+                if late_side == Signal.SELL and self._owned is not None and order["symbol"] in self._owned:
+                    self._late_realized_pnl += (
+                        self._effective_price(late_side, late_price) - self._owned[order["symbol"]]["avg_price"]
+                    ) * late
+                self._book(late_side, order["symbol"], late, late_price)
                 order["applied_qty"] = fill.filled_qty
                 booked += late
                 logger.info("pending order %s: booked a late fill %s %s x%d", order["order_no"], order["side"], order["symbol"], late)
