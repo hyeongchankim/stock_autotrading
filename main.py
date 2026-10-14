@@ -167,6 +167,7 @@ def build_broker(config: dict, seed_capital: float | None = None) -> BrokerBase:
             commission_pct=costs_cfg.get("commission_pct", 0.0),
             sell_tax_pct=costs_cfg.get("sell_tax_pct", 0.0),
             exit_order_type=kis_cfg.get("exit_order_type", "limit"),
+            order_api=kis_cfg.get("order_api", "legacy"),
         )
 
     return MockBroker(
@@ -533,6 +534,7 @@ def run_discovery(config: dict, checkpoint: str) -> None:
         commission_pct=config.get("costs", {}).get("commission_pct", 0.0),
         sell_tax_pct=config.get("costs", {}).get("sell_tax_pct", 0.0),
         exit_order_type=kis_cfg.get("exit_order_type", "limit"),
+        order_api=kis_cfg.get("order_api", "legacy"),
     )
     data_feed = KisDataFeed(env=env, session=broker.session)
     risk_manager = RiskManager(

@@ -243,6 +243,21 @@ class TestKisBroker(unittest.TestCase):
 
     @patch("broker.kis_broker.requests.post")
     @patch("broker.kis_auth.requests.get")
+    def test_order_api_v2_uses_new_tr_ids_and_exchange_field(self, mock_get, mock_post):
+        mock_get.return_value = MagicMock(
+            status_code=200, json=lambda: {"rt_cd": "0", "output1": [], "output2": [{"dnca_tot_amt": "0"}]}
+        )
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"rt_cd": "0", "output": {"ODNO": "1"}})
+        b = KisBroker(env="demo", watchlist=["005930.KS"], order_api="v2")
+        b.place_order("005930.KS", Signal.BUY, 1, 70000.0)
+        self.assertEqual(mock_post.call_args.kwargs["headers"]["tr_id"], "VTTC0012U")
+        self.assertEqual(mock_post.call_args.kwargs["json"]["EXCG_ID_DVSN_CD"], "KRX")
+        self.assertEqual(self.broker.order_api, "legacy")
+        with self.assertRaises(ValueError):
+            KisBroker(env="demo", order_api="v3")
+
+    @patch("broker.kis_broker.requests.post")
+    @patch("broker.kis_auth.requests.get")
     def test_place_order_rounds_price_to_valid_krx_tick(self, mock_get, mock_post):
         pre_order = MagicMock(
             status_code=200, json=lambda: {"rt_cd": "0", "output1": [], "output2": [{"dnca_tot_amt": "0"}]}

@@ -31,6 +31,10 @@ logger = logging.getLogger("broker.kis_broker")
 
 _BUY_TR_ID_REAL = "TTTC0802U"
 _SELL_TR_ID_REAL = "TTTC0801U"
+# order_api="v2": examples_llm/domestic_stock/order_cash (2025-09) - new tr_ids + required EXCG_ID_DVSN_CD.
+# Opt-in until a demo order has confirmed it; the legacy ids above are the demo-verified default.
+_BUY_TR_ID_REAL_V2 = "TTTC0012U"
+_SELL_TR_ID_REAL_V2 = "TTTC0011U"
 _BALANCE_TR_ID_REAL = "TTTC8434R"
 _PRICE_TR_ID = "FHKST01010100"  # same code for both real and paper
 _DAILY_FILLS_TR_ID_REAL = "TTTC0081R"  # only covers the last 3 months - fine for this bot's needs
@@ -91,6 +95,7 @@ class KisBroker(BrokerBase):
         commission_pct: float = 0.0,
         sell_tax_pct: float = 0.0,
         exit_order_type: str = "limit",
+        order_api: str = "legacy",
     ):
         """seed_capital, if given, switches get_cash_balance()/get_total_equity()
         to a locally tracked cash ledger scoped to that amount instead of the
@@ -136,6 +141,9 @@ class KisBroker(BrokerBase):
         if exit_order_type not in ("limit", "market"):
             raise ValueError("exit_order_type must be 'limit' or 'market'")
         self.exit_order_type = exit_order_type
+        if order_api not in ("legacy", "v2"):
+            raise ValueError("order_api must be 'legacy' or 'v2'")
+        self.order_api = order_api
         self._late_realized_pnl = 0.0   # P&L of SELL fills booked late by reconcile_pending (handed to RiskManager)
         self._positions_cache: tuple[float, dict] | None = None
         # Orders KIS accepted that had not (fully) filled when place_order returned. A limit order can fill
@@ -429,10 +437,11 @@ class KisBroker(BrokerBase):
         ticker = _to_kis_ticker(symbol)
         fill_price = round_to_tick(price if price is not None else self.get_current_price(symbol))
 
+        v2 = self.order_api == "v2"
         if side == Signal.BUY:
-            tr_id = self.session.real_tr_id(_BUY_TR_ID_REAL)
+            tr_id = self.session.real_tr_id(_BUY_TR_ID_REAL_V2 if v2 else _BUY_TR_ID_REAL)
         elif side == Signal.SELL:
-            tr_id = self.session.real_tr_id(_SELL_TR_ID_REAL)
+            tr_id = self.session.real_tr_id(_SELL_TR_ID_REAL_V2 if v2 else _SELL_TR_ID_REAL)
         else:
             return OrderResult(symbol, side, quantity, fill_price, False, "HOLD is not an order side")
         # captured for both sides now (previously SELL-only): BUY needs its
@@ -487,6 +496,8 @@ class KisBroker(BrokerBase):
             "ORD_QTY": str(quantity),
             "ORD_UNPR": "0" if market else str(int(fill_price)),  # a market order carries no price
         }
+        if v2:
+            body.update({"EXCG_ID_DVSN_CD": "KRX", "SLL_TYPE": "", "CNDT_PRIC": ""})
         response = _post_no_ambiguous_retry(self._order_endpoint(), self.session.headers(tr_id), body)
         if response.status_code >= 500:
             return OrderResult(
