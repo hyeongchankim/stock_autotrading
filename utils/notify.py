@@ -19,6 +19,8 @@ import os
 
 import requests
 
+from utils.names import annotate
+
 logger = logging.getLogger("utils.notify")
 
 _API_URL = "https://api.telegram.org/bot{token}/sendMessage"
@@ -34,7 +36,7 @@ def send_notification(message: str) -> None:
     try:
         response = requests.post(
             _API_URL.format(token=token),
-            json={"chat_id": chat_id, "text": message},
+            json={"chat_id": chat_id, "text": annotate(message)},
             timeout=_TIMEOUT_SECONDS,
         )
         if response.status_code != 200:

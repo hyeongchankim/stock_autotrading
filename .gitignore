@@ -12,3 +12,4 @@ macd_state.json
 .bt_cache/
 forward_log.json
 universe_cache.json
+names_cache.json

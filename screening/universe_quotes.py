@@ -19,6 +19,7 @@ import logging
 import pandas as pd
 
 from broker.kis_auth import KisSession, get_with_retry
+from utils.names import remember
 
 logger = logging.getLogger("screening.universe_quotes")
 
@@ -50,6 +51,7 @@ def fetch_quotes(session: KisSession, tickers: list[str]) -> pd.DataFrame:
                 "open": float(r["inter2_oprc"]), "high": float(r["inter2_hgpr"]),
                 "prev_close": float(r["inter2_prdy_clpr"]),
             })
+    remember({r["ticker"]: r["name"] for r in rows})
     return pd.DataFrame(rows, columns=COLUMNS)
 
 

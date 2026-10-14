@@ -11,6 +11,8 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
+from utils.names import NameFilter
+
 _LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 
 
@@ -19,11 +21,11 @@ def setup_logging(level: int = logging.INFO) -> None:
     file_handler = TimedRotatingFileHandler(
         _LOG_DIR / "trading.log", when="midnight", backupCount=30, encoding="utf-8"
     )
+    handlers = [logging.StreamHandler(), file_handler]
+    for handler in handlers:
+        handler.addFilter(NameFilter())  # "005930.KS" -> "삼성전자(005930.KS)" in every log line
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            file_handler,
-        ],
+        handlers=handlers,
     )
