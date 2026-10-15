@@ -1146,5 +1146,79 @@ class TestReconcileHandsPnlToRisk(unittest.TestCase):
         self.assertEqual(calls, ["reconcile"])
         self.assertEqual(risk.daily_realized_pnl, -12_345.0)
 
+class RejectedTokenTest(unittest.TestCase):
+    """KIS answers an expired token with HTTP 500 + msg_cd EGW00123 (2026-10-15 outage): must renew, not just retry."""
+
+    EXPIRED = MagicMock(status_code=500, json=lambda: {"rt_cd": "1", "msg_cd": "EGW00123", "msg1": "기간이 만료된 token 입니다."})
+    OK = MagicMock(status_code=200, json=lambda: {"rt_cd": "0"})
+
+    class FakeSession:
+        cache, issued = "old-token", []
+
+        def __init__(self, env):
+            pass
+
+        def _load_cached_token(self):
+            return RejectedTokenTest.FakeSession.cache
+
+        def _token_cache_path(self):
+            class P:
+                @staticmethod
+                def unlink(missing_ok=False):
+                    RejectedTokenTest.FakeSession.cache = None
+            return P
+
+        def get_access_token(self):
+            RejectedTokenTest.FakeSession.issued.append(1)
+            return "new-token"
+
+    def setUp(self):
+        self.FakeSession.cache, self.FakeSession.issued = "old-token", []
+
+    @patch("broker.kis_auth.time.sleep")
+    @patch("broker.kis_auth.requests.get")
+    def test_get_renews_expired_token_and_retries(self, mock_get, _sleep):
+        from broker.kis_auth import get_with_retry
+        mock_get.side_effect = [self.EXPIRED, self.OK]
+        headers = {"authorization": "Bearer old-token"}
+        with patch("broker.kis_auth.KisSession", self.FakeSession):
+            response = get_with_retry("https://openapivts.koreainvestment.com:29443/x", headers, {})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(headers["authorization"], "Bearer new-token")
+        self.assertEqual(mock_get.call_args.kwargs["headers"]["authorization"], "Bearer new-token")
+        self.assertEqual(len(self.FakeSession.issued), 1)
+
+    @patch("broker.kis_auth.time.sleep")
+    @patch("broker.kis_auth.requests.get")
+    def test_other_500_is_still_a_plain_retry(self, mock_get, _sleep):
+        from broker.kis_auth import get_with_retry
+        mock_get.side_effect = [MagicMock(status_code=500, json=lambda: {"msg_cd": "EGW00201"}), self.OK]
+        headers = {"authorization": "Bearer old-token"}
+        with patch("broker.kis_auth.KisSession", self.FakeSession):
+            get_with_retry("https://openapivts.koreainvestment.com:29443/x", headers, {})
+        self.assertEqual(headers["authorization"], "Bearer old-token")
+        self.assertEqual(self.FakeSession.issued, [])
+
+    @patch("broker.kis_broker.requests.post")
+    def test_order_post_renews_once_on_expired_token(self, mock_post):
+        from broker.kis_broker import _post_no_ambiguous_retry
+        mock_post.side_effect = [self.EXPIRED, self.OK]
+        headers = {"authorization": "Bearer old-token"}
+        with patch("broker.kis_auth.KisSession", self.FakeSession):
+            response = _post_no_ambiguous_retry("https://openapivts.koreainvestment.com:29443/o", headers, {})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(mock_post.call_args.kwargs["headers"]["authorization"], "Bearer new-token")
+
+    @patch("broker.kis_broker.requests.post")
+    def test_order_post_does_not_resend_on_other_500(self, mock_post):
+        from broker.kis_broker import _post_no_ambiguous_retry
+        mock_post.return_value = MagicMock(status_code=500, json=lambda: {"msg_cd": "EGW00201"})
+        with patch("broker.kis_auth.KisSession", self.FakeSession):
+            response = _post_no_ambiguous_retry("https://openapivts.koreainvestment.com:29443/o", {"authorization": "Bearer t"}, {})
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(mock_post.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -36,6 +36,27 @@ _MAX_RETRIES = 3
 _RETRY_BACKOFF_SECONDS = 1.0
 _TOKEN_RATE_LIMIT_CODE = "EGW00133"  # "토큰 발급 잠시 후 다시 시도하세요(1분당 1회)"
 _TOKEN_RATE_LIMIT_WAIT_SECONDS = 61
+_TOKEN_REJECTED_CODES = ("EGW00123", "EGW00121")  # "기간이 만료된 token" / "유효하지 않은 token" - KIS sends them as HTTP 500
+
+
+def renew_rejected_token(response: requests.Response, headers: dict, url: str) -> bool:
+    """KIS can reject a token the local cache still thinks is valid (2026-10-15: the cache said 14:07, KIS said expired
+    from 09:15) and answers HTTP 500 with msg_cd EGW00123 - which looked like a transient server error, so every cycle
+    retried the same dead token and crashed. If the response says so, swap in a fresh token (re-issued unless another
+    process already refreshed the shared cache) and update `headers` in place. True = the caller should retry."""
+    try:
+        code = response.json().get("msg_cd")
+    except ValueError:
+        return False
+    if code not in _TOKEN_REJECTED_CODES:
+        return False
+    session = KisSession("demo" if "openapivts" in url else "real")
+    stale = headers.get("authorization", "").removeprefix("Bearer ")
+    if session._load_cached_token() == stale:
+        session._token_cache_path().unlink(missing_ok=True)
+    logger.warning("KIS rejected the access token (%s) - using a fresh one", code)
+    headers["authorization"] = f"Bearer {session.get_access_token()}"
+    return True
 
 
 def get_with_retry(url: str, headers: dict, params: dict, timeout: int = 10) -> requests.Response:
@@ -54,6 +75,8 @@ def get_with_retry(url: str, headers: dict, params: dict, timeout: int = 10) -> 
             time.sleep(_RETRY_BACKOFF_SECONDS * (attempt + 1))
             continue
 
+        if response.status_code >= 500 and renew_rejected_token(response, headers, url):
+            continue
         if response.status_code >= 500:
             last_exc = requests.exceptions.HTTPError(f"{response.status_code} server error")
             logger.warning(
@@ -157,13 +180,14 @@ class KisSession:
         path.write_text(json.dumps({"access_token": access_token, "expiry": expiry}), encoding="utf-8")
 
     def get_access_token(self) -> str:
-        if self._access_token and time.time() < self._token_expiry - 600:
-            return self._access_token
-
+        # the shared cache file is the source of truth: it also carries a token renewed mid-run by
+        # renew_rejected_token() or by a sibling process, which this object's in-memory copy would not know about
         cached = self._load_cached_token()
         if cached:
             self._access_token = cached
             return cached
+        if self._access_token and time.time() < self._token_expiry - 600:  # cache unreadable (e.g. read-only disk)
+            return self._access_token
 
         for attempt in range(2):
             response = requests.post(

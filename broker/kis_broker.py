@@ -22,7 +22,7 @@ from datetime import date
 import requests
 
 from broker.base import BrokerBase, OrderResult
-from broker.kis_auth import KisSession, get_with_retry
+from broker.kis_auth import KisSession, get_with_retry, renew_rejected_token
 from broker.krx_tick import round_to_tick
 from portfolio.portfolio import Position
 from strategies.base import Signal
@@ -75,7 +75,11 @@ def _post_no_ambiguous_retry(url: str, headers: dict, json_body: dict, timeout: 
     last_exc: Exception | None = None
     for attempt in range(_MAX_RETRIES):
         try:
-            return requests.post(url, headers=headers, json=json_body, timeout=timeout)
+            response = requests.post(url, headers=headers, json=json_body, timeout=timeout)
+            # an expired/invalid token is rejected before any order processing, so one re-send cannot double-order
+            if response.status_code >= 500 and attempt == 0 and renew_rejected_token(response, headers, url):
+                continue
+            return response
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
             last_exc = exc
             logger.warning(
